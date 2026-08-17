@@ -1,1 +1,11 @@
-
+fastapi
+uvicorn
+langserve
+langchain
+langchain-google-genai
+langchain-community
+langchain-core
+duckduckgo-search
+wikipedia
+python-dotenv
+sse-starlette
