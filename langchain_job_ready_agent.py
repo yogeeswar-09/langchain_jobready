@@ -1,2088 +1,686 @@
 import os
 import logging
 from io import BytesIO
-from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from dotenv import load_dotenv
-
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse
-
-from langserve import add_routes
-
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.runnables import RunnableLambda
-from langchain_core.prompts import ChatPromptTemplate
-
 from langchain_community.tools import DuckDuckGoSearchRun
-
+from langserve import add_routes
 
 # ============================================================
-# ENVIRONMENT
+# CONFIG
 # ============================================================
 
 load_dotenv()
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-
 if not GOOGLE_API_KEY:
-    raise ValueError(
-        "GOOGLE_API_KEY is missing. "
-        "Add GOOGLE_API_KEY in Render Environment Variables."
-    )
-
-
-# ============================================================
-# LOGGING
-# ============================================================
+    raise ValueError("GOOGLE_API_KEY is missing.")
 
 logging.basicConfig(level=logging.INFO)
-
 logger = logging.getLogger("placement_agent")
 
-
-# ============================================================
-# LLM
-# ============================================================
-
 llm = ChatGoogleGenerativeAI(
-    model="gemma-4-31b-it",
+    model="gemini-2.5-flash",
     google_api_key=GOOGLE_API_KEY,
     temperature=0,
 )
 
-
 # ============================================================
-# PDF TEXT EXTRACTION
+# PDF
 # ============================================================
 
 def extract_pdf_text(file_bytes: bytes) -> str:
-
-    reader = PdfReader(
-        BytesIO(file_bytes)
-    )
-
+    reader = PdfReader(BytesIO(file_bytes))
     pages = []
 
     for page in reader.pages:
-
-        text = page.extract_text()
-
-        if text:
-            pages.append(text)
+        text = page.extract_text() or ""
+        if text.strip():
+            pages.append(text.strip())
 
     result = "\n\n".join(pages).strip()
 
     if not result:
-        raise ValueError(
-            "Could not extract readable text from the PDF."
-        )
+        raise ValueError("No readable text was found in the PDF.")
 
     return result
 
-
 # ============================================================
-# JOB SEARCH TOOL
+# JOB SEARCH
 # ============================================================
 
 def search_job_requirements(role: str) -> str:
-
-    logger.info(
-        "Searching job requirements for: %s",
-        role
-    )
-
     try:
-
         search = DuckDuckGoSearchRun()
-
-        query = f"""
-        Search for recent internship and entry-level
-        campus placement job requirements for:
-
-        {role}
-
-        Find commonly requested:
-        - programming languages
-        - frameworks
-        - databases
-        - cloud technologies
-        - AI/ML skills
-        - tools
-        - soft skills
-
-        Focus on current industry requirements.
-        """
-
+        query = (
+            f"current skills requirements for {role} internship "
+            f"entry level campus placement jobs programming frameworks "
+            f"databases cloud AI ML tools"
+        )
         result = search.invoke(query)
-
-        return str(result)[:12000]
-
+        return str(result)[:10000]
     except Exception as exc:
-
-        logger.exception(
-            "Job search failed"
-        )
-
-        return (
-            "Job search was unavailable. "
-            f"Reason: {exc}"
-        )
-
+        logger.exception("Job search failed")
+        return f"Job search unavailable: {exc}"
 
 # ============================================================
-# SKILL GAP ANALYSIS
+# SKILL GAP
 # ============================================================
 
-def analyze_skill_gap(
-    resume_text: str,
-    role: str
-) -> str:
-
-    logger.info(
-        "Running skill gap analysis"
-    )
-
+def analyze_skill_gap(resume: str, role: str) -> str:
     prompt = f"""
 You are a campus placement skill-gap analyst.
 
-TARGET ROLE:
+Target role:
 {role}
 
-STUDENT RESUME:
-{resume_text[:16000]}
+Student resume:
+{resume[:14000]}
 
-Analyze the student's current skills against
-the target placement role.
+Identify:
+1. Current relevant skills
+2. Missing skills
+3. Weak/basic skills
+4. High-priority skills to learn
+5. Medium-priority skills to learn
 
-Return:
-
-CURRENT SKILLS
-- Skills clearly demonstrated in the resume.
-
-MISSING SKILLS
-- Important skills that are not demonstrated.
-
-WEAK / NEEDS IMPROVEMENT
-- Skills that appear limited or basic.
-
-PRIORITY
-- High priority
-- Medium priority
-- Low priority
-
-Be evidence-based.
-
-Do not invent skills that are not present
-in the resume.
+Only use evidence from the resume. Do not invent experience.
 """
-
     try:
-
-        response = llm.invoke(
-            prompt
-        )
-
-        return response.content
-
+        return str(llm.invoke(prompt).content)
     except Exception as exc:
-
-        logger.exception(
-            "Skill gap analysis failed"
-        )
-
-        return (
-            f"Skill gap analysis failed: {exc}"
-        )
-
+        logger.exception("Skill gap analysis failed")
+        return f"Skill gap analysis unavailable: {exc}"
 
 # ============================================================
 # PROJECT RECOMMENDATION
 # ============================================================
 
-def recommend_projects(
-    resume_text: str,
-    role: str,
-    skill_gap: str
-) -> str:
-
-    logger.info(
-        "Generating project recommendations"
-    )
-
+def recommend_projects(resume: str, role: str, gaps: str) -> str:
     prompt = f"""
-You are a campus placement project mentor.
+You are a placement project mentor.
 
-TARGET ROLE:
+Target role:
 {role}
 
-STUDENT RESUME:
-{resume_text[:12000]}
+Student resume:
+{resume[:10000]}
 
-SKILL GAP ANALYSIS:
-{skill_gap[:8000]}
+Skill gaps:
+{gaps[:7000]}
 
-Recommend 3 practical portfolio projects.
+Recommend exactly 3 realistic portfolio projects.
 
-The projects must:
+For each project include:
+- Project name
+- Problem
+- Key features
+- Technology stack
+- Skills demonstrated
+- Why it helps placement
+- Difficulty
 
-- address important skill gaps
-- match the target role
-- be realistic for a college student
-- be suitable for GitHub
-- demonstrate meaningful technical skills
-- help during campus placements
-
-For every project provide:
-
-PROJECT NAME
-PROBLEM
-KEY FEATURES
-TECHNOLOGY STACK
-SKILLS DEVELOPED
-WHY IT HELPS PLACEMENT
-DIFFICULTY
-
-Avoid generic or unrelated projects.
+Projects should directly address the skill gaps and target role.
 """
-
     try:
-
-        response = llm.invoke(
-            prompt
-        )
-
-        return response.content
-
+        return str(llm.invoke(prompt).content)
     except Exception as exc:
-
-        logger.exception(
-            "Project recommendation failed"
-        )
-
-        return (
-            f"Project recommendation failed: {exc}"
-        )
-
+        logger.exception("Project recommendation failed")
+        return f"Project recommendations unavailable: {exc}"
 
 # ============================================================
-# GITHUB EVALUATION
+# GITHUB
 # ============================================================
 
-def evaluate_github(
-    username: str,
-    role: str
-) -> str:
-
-    logger.info(
-        "Evaluating GitHub: %s",
-        username
-    )
-
+def evaluate_github(username: str, role: str) -> str:
     username = username.strip()
 
     if "github.com/" in username:
+        username = username.split("github.com/", 1)[1]
 
-        username = username.split(
-            "github.com/"
-        )[-1]
-
-    username = username.rstrip(
-        "/"
-    ).split("/")[0]
+    username = username.strip("/").split("/")[0]
 
     if not username:
-
         return "No GitHub username provided."
 
     headers = {
-        "Accept":
-            "application/vnd.github+json",
-
-        "User-Agent":
-            "Placement-Ready-AI-Agent"
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "Placement-Ready-AI-Agent",
     }
 
     try:
-
-        profile_url = (
-            f"https://api.github.com/users/{username}"
-        )
-
+        profile_url = f"https://api.github.com/users/{username}"
         repos_url = (
             f"https://api.github.com/users/{username}/repos"
-            f"?per_page=100&sort=updated"
+            "?per_page=30&sort=updated"
         )
 
         profile_response = requests.get(
-            profile_url,
-            headers=headers,
-            timeout=15
+            profile_url, headers=headers, timeout=15
         )
 
         if profile_response.status_code == 404:
-
-            return (
-                f"GitHub user '{username}' was not found."
-            )
+            return f"GitHub user '{username}' was not found."
 
         profile_response.raise_for_status()
 
-        profile = profile_response.json()
-
-
         repos_response = requests.get(
-            repos_url,
-            headers=headers,
-            timeout=15
+            repos_url, headers=headers, timeout=15
         )
-
         repos_response.raise_for_status()
 
+        profile = profile_response.json()
         repos = repos_response.json()
 
-        if not isinstance(repos, list):
+        repo_lines = []
+        for repo in repos[:30]:
+            repo_lines.append(
+                f"- {repo.get('name')} | "
+                f"language={repo.get('language')} | "
+                f"stars={repo.get('stargazers_count', 0)} | "
+                f"description={repo.get('description') or 'No description'}"
+            )
 
-            repos = []
+        github_data = f"""
+Username: {username}
+Name: {profile.get('name')}
+Bio: {profile.get('bio')}
+Public repositories: {profile.get('public_repos', 0)}
+Followers: {profile.get('followers', 0)}
+Profile: {profile.get('html_url')}
 
-
-        repo_data = []
-
-        for repo in repos[:25]:
-
-            repo_data.append({
-
-                "name":
-                    repo.get("name"),
-
-                "description":
-                    repo.get("description"),
-
-                "language":
-                    repo.get("language"),
-
-                "stars":
-                    repo.get("stargazers_count"),
-
-                "forks":
-                    repo.get("forks_count"),
-
-                "updated":
-                    repo.get("updated_at"),
-
-                "url":
-                    repo.get("html_url")
-
-            })
-
-
-        github_data = {
-
-            "username":
-                username,
-
-            "name":
-                profile.get("name"),
-
-            "bio":
-                profile.get("bio"),
-
-            "profile":
-                profile.get("html_url"),
-
-            "public_repositories":
-                profile.get("public_repos", 0),
-
-            "followers":
-                profile.get("followers", 0),
-
-            "following":
-                profile.get("following", 0),
-
-            "repositories":
-                repo_data
-        }
-
+Repositories:
+{chr(10).join(repo_lines)}
+"""
 
         prompt = f"""
-You are a technical recruiter.
+You are a technical recruiter evaluating GitHub for a campus placement.
 
-Evaluate this public GitHub profile
-for the target campus placement role.
-
-TARGET ROLE:
+Target role:
 {role}
 
-GITHUB DATA:
+GitHub information:
 {github_data}
 
 Evaluate:
-
 1. Profile strength
-2. Number and quality of projects
+2. Project relevance
 3. Technology relevance
-4. Repository activity
-5. Project descriptions
-6. Documentation
-7. Portfolio presentation
-8. Areas to improve
-9. Recruiter impression
+4. Repository presentation
+5. Activity signals available in the supplied data
+6. Improvements
+7. GitHub readiness score out of 100
 
-Give a GitHub readiness score out of 100.
-
-IMPORTANT:
-
-Only use the GitHub data provided.
-
-Do not claim that you inspected source code,
-commits, README files, or code quality unless
-that information is explicitly available.
+Do not claim to have inspected source code, commits, or README files unless
+that information is present in the supplied data.
 """
-
-        response = llm.invoke(
-            prompt
-        )
-
-        return response.content
-
-    except requests.RequestException as exc:
-
-        logger.exception(
-            "GitHub API failed"
-        )
-
-        return (
-            f"GitHub API error: {exc}"
-        )
+        return str(llm.invoke(prompt).content)
 
     except Exception as exc:
-
-        logger.exception(
-            "GitHub evaluation failed"
-        )
-
-        return (
-            f"GitHub evaluation failed: {exc}"
-        )
-
+        logger.exception("GitHub evaluation failed")
+        return f"GitHub evaluation unavailable: {exc}"
 
 # ============================================================
-# FINAL SYNTHESIS
+# FINAL REPORT
 # ============================================================
 
-def generate_final_report(
+def final_report(
     role: str,
-    resume_text: str,
-    job_requirements: str,
-    skill_gap: str,
+    resume: str,
+    jobs: str,
+    gaps: str,
     projects: str,
-    github_report: str
+    github: str,
 ) -> str:
-
-    logger.info(
-        "Generating final placement report"
-    )
-
     prompt = f"""
-You are the final Placement-Ready AI Agent.
+You are a Placement-Ready AI Agent.
 
-Your job is to synthesize the complete analysis
-for a college student preparing for campus placements.
+Create a professional campus-placement readiness report.
 
 TARGET ROLE:
 {role}
 
-
-STUDENT RESUME:
-{resume_text[:12000]}
-
+RESUME:
+{resume[:10000]}
 
 JOB REQUIREMENTS:
-{job_requirements[:10000]}
+{jobs[:8000]}
 
-
-SKILL GAP ANALYSIS:
-{skill_gap[:8000]}
-
+SKILL GAP:
+{gaps[:7000]}
 
 PROJECT RECOMMENDATIONS:
-{projects[:8000]}
-
+{projects[:7000]}
 
 GITHUB EVALUATION:
-{github_report[:8000]}
+{github[:7000]}
 
-
-Create a professional placement-readiness report.
-
-Use exactly this structure:
-
+Use this structure:
 
 PLACEMENT READINESS REPORT
 
-Target Role:
-{role}
-
+Target Role: {role}
 
 1. JOB OPPORTUNITY ANALYSIS
-
-Explain the important skills and requirements
-currently relevant to this role.
-
+Summarize the most important requirements.
 
 2. CURRENT SKILLS
-
-List the student's strongest relevant skills
-based only on the resume.
-
+List the student's strongest relevant skills.
 
 3. SKILL GAP ANALYSIS
-
-Explain:
-
-- High priority gaps
-- Medium priority gaps
-- Low priority gaps
-
+Separate high, medium and low priority gaps.
 
 4. RECOMMENDED PROJECTS
-
-Recommend the best projects from the analysis.
-
-Explain why each project helps.
-
+Give the best recommended projects and explain why.
 
 5. GITHUB EVALUATION
-
-Summarize:
-
-- strengths
-- weaknesses
-- improvements
-- recruiter impression
-
+Give strengths, weaknesses and improvements.
 
 6. PRIORITY ACTION PLAN
-
-Give exactly 5 actionable steps.
-
-Example:
-
-1. Learn ...
-2. Build ...
-3. Improve GitHub ...
-4. Practice ...
-5. Apply ...
-
+Give exactly 5 practical next steps.
 
 7. OVERALL PLACEMENT READINESS
-
-Give a score from 0 to 100.
-
-Format:
-
+Give a score in exactly this format:
 Overall Placement Readiness: XX/100
 
 Then give a short explanation.
 
-
-IMPORTANT:
-
-- Do not invent information.
-- Do not claim unsupported achievements.
-- Keep recommendations realistic.
-- Be honest about weaknesses.
-- Make the report useful for campus placement preparation.
+Be honest. Do not invent achievements or experience.
 """
-
     try:
-
-        response = llm.invoke(
-            prompt
-        )
-
-        return response.content
-
+        return str(llm.invoke(prompt).content)
     except Exception as exc:
-
-        logger.exception(
-            "Final synthesis failed"
-        )
-
-        return (
-            "Final synthesis failed: "
-            f"{exc}"
-        )
-
+        logger.exception("Final report failed")
+        return f"Final report unavailable: {exc}"
 
 # ============================================================
-# COMPLETE PLACEMENT WORKFLOW
+# COMPLETE WORKFLOW
 # ============================================================
 
-def run_complete_analysis(
-    resume_text: str,
-    role: str,
-    github_id: str
-) -> str:
+def run_workflow(resume: str, role: str, github: str) -> str:
+    logger.info("Starting placement workflow")
 
-    logger.info(
-        "Starting complete placement workflow"
-    )
+    jobs = search_job_requirements(role)
+    logger.info("Job analysis complete")
 
+    gaps = analyze_skill_gap(resume, role)
+    logger.info("Skill gap analysis complete")
 
-    # --------------------------------------------------------
-    # STEP 1
-    # Job search
-    # --------------------------------------------------------
+    projects = recommend_projects(resume, role, gaps)
+    logger.info("Project recommendations complete")
 
-    job_requirements = search_job_requirements(
-        role
-    )
+    github_report = evaluate_github(github, role)
+    logger.info("GitHub evaluation complete")
 
-
-    # --------------------------------------------------------
-    # STEP 2
-    # Skill gap
-    # --------------------------------------------------------
-
-    skill_gap = analyze_skill_gap(
-        resume_text,
-        role
-    )
-
-
-    # --------------------------------------------------------
-    # STEP 3
-    # Project recommendations
-    # --------------------------------------------------------
-
-    projects = recommend_projects(
-        resume_text,
-        role,
-        skill_gap
-    )
-
-
-    # --------------------------------------------------------
-    # STEP 4
-    # GitHub
-    # --------------------------------------------------------
-
-    github_report = evaluate_github(
-        github_id,
-        role
-    )
-
-
-    # --------------------------------------------------------
-    # STEP 5
-    # Final synthesis
-    # --------------------------------------------------------
-
-    final_report = generate_final_report(
+    report = final_report(
         role=role,
-        resume_text=resume_text,
-        job_requirements=job_requirements,
-        skill_gap=skill_gap,
+        resume=resume,
+        jobs=jobs,
+        gaps=gaps,
         projects=projects,
-        github_report=github_report
+        github=github_report,
     )
 
-
-    logger.info(
-        "Placement workflow completed"
-    )
-
-
-    return final_report
-
+    logger.info("Placement workflow complete")
+    return report
 
 # ============================================================
-# FASTAPI APP
+# FASTAPI
 # ============================================================
 
 app = FastAPI(
     title="Placement-Ready AI Agent",
-    version="2.0",
+    version="1.0",
     description=(
-        "LangChain-powered AI Agent for campus placement "
-        "preparation."
-    )
+        "LangChain placement agent for job analysis, skill gaps, "
+        "project recommendations and GitHub evaluation."
+    ),
 )
 
-
 # ============================================================
-# MAIN APPLICATION UI
+# MAIN WEB APP
 # ============================================================
 
-HTML_PAGE = r"""
+HTML = """
 <!DOCTYPE html>
-
-<html lang="en">
-
+<html>
 <head>
-
 <meta charset="UTF-8">
-
-<meta name="viewport"
-      content="width=device-width, initial-scale=1.0">
-
-<title>
-Placement-Ready AI Agent
-</title>
-
-
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Placement-Ready AI Agent</title>
 <style>
-
-* {
-    box-sizing: border-box;
+body{
+    margin:0;
+    background:#070b14;
+    color:#e5e7eb;
+    font-family:Arial,sans-serif;
 }
-
-body {
-
-    margin: 0;
-
-    min-height: 100vh;
-
-    font-family:
-        Inter,
-        system-ui,
-        -apple-system,
-        BlinkMacSystemFont,
-        "Segoe UI",
-        sans-serif;
-
-    background:
-        radial-gradient(
-            circle at top left,
-            #172554 0,
-            #090d18 35%,
-            #05070d 100%
-        );
-
-    color: #f8fafc;
+.wrap{
+    width:min(950px,92%);
+    margin:50px auto;
 }
-
-
-.container {
-
-    width: min(
-        1100px,
-        92%
-    );
-
-    margin: auto;
-
-    padding:
-        50px 0 70px;
+h1{text-align:center;margin-bottom:10px}
+.sub{text-align:center;color:#94a3b8;margin-bottom:30px}
+.card{
+    background:#0f172a;
+    border:1px solid #263244;
+    border-radius:18px;
+    padding:28px;
 }
-
-
-.header {
-
-    text-align: center;
-
-    margin-bottom: 35px;
+label{
+    display:block;
+    margin:18px 0 8px;
+    font-weight:bold;
 }
-
-
-.badge {
-
-    display: inline-block;
-
-    padding:
-        8px 14px;
-
-    border:
-        1px solid #334155;
-
-    border-radius:
-        999px;
-
-    background:
-        rgba(
-            15,
-            23,
-            42,
-            0.8
-        );
-
-    color:
-        #93c5fd;
-
-    font-size:
-        13px;
-
-    font-weight:
-        600;
-
-    margin-bottom:
-        16px;
+input{
+    width:100%;
+    box-sizing:border-box;
+    padding:13px;
+    border-radius:10px;
+    border:1px solid #334155;
+    background:#080d18;
+    color:white;
 }
-
-
-h1 {
-
-    margin: 0;
-
-    font-size:
-        clamp(
-            32px,
-            5vw,
-            56px
-        );
+button{
+    width:100%;
+    margin-top:25px;
+    padding:15px;
+    border:0;
+    border-radius:10px;
+    background:#2563eb;
+    color:white;
+    font-size:16px;
+    font-weight:bold;
+    cursor:pointer;
 }
-
-
-.subtitle {
-
-    max-width:
-        720px;
-
-    margin:
-        18px auto 0;
-
-    color:
-        #94a3b8;
-
-    font-size:
-        17px;
-
-    line-height:
-        1.7;
+button:disabled{opacity:.5}
+#status{
+    margin-top:20px;
+    color:#93c5fd;
+    display:none;
 }
-
-
-.card {
-
-    background:
-        rgba(
-            15,
-            23,
-            42,
-            0.88
-        );
-
-    border:
-        1px solid #1e293b;
-
-    border-radius:
-        20px;
-
-    padding:
-        28px;
-
-    box-shadow:
-        0 25px 70px
-        rgba(
-            0,
-            0,
-            0,
-            0.35
-        );
+#report{
+    margin-top:25px;
+    padding:25px;
+    background:#080d18;
+    border:1px solid #263244;
+    border-radius:14px;
+    white-space:pre-wrap;
+    line-height:1.65;
+    display:none;
 }
-
-
-.grid {
-
-    display:
-        grid;
-
-    grid-template-columns:
-        repeat(
-            2,
-            minmax(
-                0,
-                1fr
-            )
-        );
-
-    gap:
-        20px;
+.links{
+    text-align:center;
+    margin-top:20px;
 }
-
-
-.full {
-
-    grid-column:
-        1 / -1;
-}
-
-
-.field {
-
-    margin-bottom:
-        20px;
-}
-
-
-label {
-
-    display:
-        block;
-
-    margin-bottom:
-        9px;
-
-    color:
-        #e2e8f0;
-
-    font-size:
-        14px;
-
-    font-weight:
-        650;
-}
-
-
-input[type="text"] {
-
-    width:
-        100%;
-
-    padding:
-        14px 15px;
-
-    border:
-        1px solid #334155;
-
-    border-radius:
-        12px;
-
-    outline:
-        none;
-
-    background:
-        #0b1120;
-
-    color:
-        #f8fafc;
-
-    font-size:
-        15px;
-}
-
-
-input[type="text"]:focus {
-
-    border-color:
-        #60a5fa;
-}
-
-
-.file-box {
-
-    border:
-        1.5px dashed #475569;
-
-    border-radius:
-        14px;
-
-    padding:
-        22px;
-
-    background:
-        #0b1120;
-}
-
-
-input[type="file"] {
-
-    width:
-        100%;
-
-    color:
-        #94a3b8;
-}
-
-
-.help {
-
-    margin-top:
-        8px;
-
-    color:
-        #64748b;
-
-    font-size:
-        12px;
-}
-
-
-.button {
-
-    width:
-        100%;
-
-    margin-top:
-        8px;
-
-    padding:
-        15px 20px;
-
-    border:
-        0;
-
-    border-radius:
-        12px;
-
-    background:
-        linear-gradient(
-            135deg,
-            #2563eb,
-            #4f46e5
-        );
-
-    color:
-        white;
-
-    font-size:
-        16px;
-
-    font-weight:
-        700;
-
-    cursor:
-        pointer;
-}
-
-
-.button:disabled {
-
-    opacity:
-        0.55;
-
-    cursor:
-        not-allowed;
-}
-
-
-.status {
-
-    display:
-        none;
-
-    margin-top:
-        22px;
-
-    padding:
-        14px 16px;
-
-    border-radius:
-        12px;
-
-    background:
-        #0f172a;
-
-    border:
-        1px solid #1e293b;
-
-    color:
-        #94a3b8;
-}
-
-
-.status.show {
-
-    display:
-        block;
-}
-
-
-.status.error {
-
-    color:
-        #fca5a5;
-
-    border-color:
-        #7f1d1d;
-
-    background:
-        #1c0b0b;
-}
-
-
-.report {
-
-    display:
-        none;
-
-    margin-top:
-        28px;
-}
-
-
-.report.show {
-
-    display:
-        block;
-}
-
-
-.report-header {
-
-    display:
-        flex;
-
-    align-items:
-        center;
-
-    justify-content:
-        space-between;
-
-    gap:
-        20px;
-
-    margin-bottom:
-        18px;
-}
-
-
-.report-title {
-
-    font-size:
-        24px;
-
-    font-weight:
-        750;
-}
-
-
-.score {
-
-    min-width:
-        120px;
-
-    padding:
-        12px 16px;
-
-    text-align:
-        center;
-
-    border:
-        1px solid #334155;
-
-    border-radius:
-        14px;
-
-    background:
-        #0b1120;
-}
-
-
-.score-number {
-
-    font-size:
-        27px;
-
-    font-weight:
-        800;
-
-    color:
-        #60a5fa;
-}
-
-
-.score-label {
-
-    color:
-        #64748b;
-
-    font-size:
-        11px;
-
-    text-transform:
-        uppercase;
-}
-
-
-.report-body {
-
-    white-space:
-        pre-wrap;
-
-    line-height:
-        1.75;
-
-    color:
-        #cbd5e1;
-
-    font-size:
-        15px;
-}
-
-
-.links {
-
-    margin-top:
-        20px;
-
-    text-align:
-        center;
-}
-
-
-.links a {
-
-    color:
-        #60a5fa;
-
-    text-decoration:
-        none;
-
-    margin:
-        0 8px;
-
-    font-size:
-        13px;
-}
-
-
-.footer {
-
-    text-align:
-        center;
-
-    margin-top:
-        25px;
-
-    color:
-        #475569;
-
-    font-size:
-        12px;
-}
-
-
-@media (
-    max-width: 700px
-) {
-
-    .grid {
-
-        grid-template-columns:
-            1fr;
-    }
-
-    .full {
-
-        grid-column:
-            auto;
-    }
-
-    .report-header {
-
-        flex-direction:
-            column;
-
-        align-items:
-            flex-start;
-    }
-
-}
-
+a{color:#60a5fa;margin:0 8px}
 </style>
-
 </head>
-
-
 <body>
-
-
-<div class="container">
-
-
-<div class="header">
-
-<div class="badge">
-LANGCHAIN • GEMMA • AI AGENT
-</div>
-
-
-<h1>
-Placement-Ready AI Agent
-</h1>
-
-
-<p class="subtitle">
-
-Analyze job opportunities,
-identify skill gaps,
-recommend projects,
+<div class="wrap">
+<h1>Placement-Ready AI Agent</h1>
+<div class="sub">
+Analyze job opportunities, identify skill gaps, recommend projects,
 and evaluate your GitHub profile.
-
-</p>
-
 </div>
-
-
 
 <div class="card">
+<form id="form">
 
+<label>Resume PDF</label>
+<input id="resume" type="file" accept=".pdf" required>
 
-<form id="analysisForm">
+<label>Target Placement Role</label>
+<input id="role" type="text" placeholder="AI/ML Engineer" required>
 
+<label>GitHub Username</label>
+<input id="github" type="text" placeholder="yogeeswar-09" required>
 
-<div class="grid">
-
-
-<div class="field full">
-
-
-<label>
-Resume PDF
-</label>
-
-
-<div class="file-box">
-
-
-<input
-    id="resume"
-    type="file"
-    accept=".pdf,application/pdf"
-    required
->
-
-
-<div class="help">
-Upload your text-based PDF resume.
-</div>
-
-
-</div>
-
-</div>
-
-
-
-<div class="field">
-
-
-<label>
-Target Placement Role
-</label>
-
-
-<input
-    id="role"
-    type="text"
-    placeholder="AI/ML Engineer"
-    required
->
-
-
-</div>
-
-
-
-<div class="field">
-
-
-<label>
-GitHub Username
-</label>
-
-
-<input
-    id="github_id"
-    type="text"
-    placeholder="yogeeswar-09"
-    required
->
-
-
-</div>
-
-
-</div>
-
-
-<button
-    id="analyzeButton"
-    class="button"
-    type="submit"
->
-
+<button id="button" type="submit">
 Analyze Placement Readiness
-
 </button>
-
 
 </form>
 
-
-<div
-    id="status"
-    class="status"
-></div>
-
-
-<div
-    id="report"
-    class="report"
->
-
-
-<div class="report-header">
-
-
-<div class="report-title">
-
-Placement Readiness Report
-
+<div id="status"></div>
+<div id="report"></div>
 </div>
-
-
-<div class="score">
-
-
-<div
-    id="scoreNumber"
-    class="score-number"
->
-—
-</div>
-
-
-<div class="score-label">
-Readiness
-</div>
-
-
-</div>
-
-
-</div>
-
-
-<div
-    id="reportBody"
-    class="report-body"
-></div>
-
-
-</div>
-
-
-</div>
-
-
 
 <div class="links">
-
-<a
-    href="/agent/playground/"
-    target="_blank"
->
-LangServe Playground
-</a>
-
-
-<a
-    href="/docs"
-    target="_blank"
->
-API Docs
-</a>
-
-
-<a
-    href="/health"
-    target="_blank"
->
-Health
-</a>
-
+<a href="/agent/playground/" target="_blank">LangServe Playground</a>
+<a href="/docs" target="_blank">API Docs</a>
+<a href="/health" target="_blank">Health</a>
 </div>
-
-
-<div class="footer">
-
-Placement-Ready AI Agent
-•
-LangChain
-•
-FastAPI
-•
-Render
-
 </div>
-
-
-</div>
-
-
 
 <script>
-
-
-const form =
-    document.getElementById(
-        "analysisForm"
-    );
-
-
-const button =
-    document.getElementById(
-        "analyzeButton"
-    );
-
-
-const status =
-    document.getElementById(
-        "status"
-    );
-
-
-const report =
-    document.getElementById(
-        "report"
-    );
-
-
-const reportBody =
-    document.getElementById(
-        "reportBody"
-    );
-
-
-const scoreNumber =
-    document.getElementById(
-        "scoreNumber"
-    );
-
-
-form.addEventListener(
-    "submit",
-    async function(event) {
-
-        event.preventDefault();
-
-
-        const resume =
-            document.getElementById(
-                "resume"
-            ).files[0];
-
-
-        const role =
-            document.getElementById(
-                "role"
-            ).value.trim();
-
-
-        const githubId =
-            document.getElementById(
-                "github_id"
-            ).value.trim();
-
-
-        if (!resume) {
-
-            showError(
-                "Please select your Resume PDF."
-            );
-
-            return;
-        }
-
-
-        if (
-            !resume.name
-                .toLowerCase()
-                .endsWith(".pdf")
-        ) {
-
-            showError(
-                "Only PDF resumes are supported."
-            );
-
-            return;
-        }
-
-
-        if (!role) {
-
-            showError(
-                "Please enter your target role."
-            );
-
-            return;
-        }
-
-
-        if (!githubId) {
-
-            showError(
-                "Please enter your GitHub username."
-            );
-
-            return;
-        }
-
-
-        button.disabled =
-            true;
-
-
-        button.textContent =
-            "Analyzing... Please wait";
-
-
-        report.classList.remove(
-            "show"
-        );
-
-
-        showStatus(
-            "Running placement analysis..."
-        );
-
-
-        const formData =
-            new FormData();
-
-
-        formData.append(
-            "resume",
-            resume
-        );
-
-
-        formData.append(
-            "role",
-            role
-        );
-
-
-        formData.append(
-            "github_id",
-            githubId
-        );
-
-
-        try {
-
-            const response =
-                await fetch(
-                    "/api/analyze",
-                    {
-                        method:
-                            "POST",
-
-                        body:
-                            formData
-                    }
-                );
-
-
-            const data =
-                await response.json();
-
-
-            if (!response.ok) {
-
-                throw new Error(
-                    data.detail ||
-                    "Analysis failed."
-                );
-            }
-
-
-            reportBody.textContent =
-                data.report ||
-                "No report returned.";
-
-
-            scoreNumber.textContent =
-                extractScore(
-                    data.report
-                );
-
-
-            report.classList.add(
-                "show"
-            );
-
-
-            showStatus(
-                "Placement analysis completed successfully."
-            );
-
-
-            setTimeout(
-                function() {
-
-                    report.scrollIntoView({
-                        behavior:
-                            "smooth"
-                    });
-
-                },
-                100
-            );
-
-
-        }
-        catch (error) {
-
-            showError(
-                error.message ||
-                "Something went wrong."
-            );
-
-        }
-        finally {
-
-            button.disabled =
-                false;
-
-
-            button.textContent =
-                "Analyze Placement Readiness";
-
-        }
-
-    }
-);
-
-
-function showStatus(
-    message
-) {
-
-    status.className =
-        "status show";
-
-    status.textContent =
-        message;
-}
-
-
-function showError(
-    message
-) {
-
-    status.className =
-        "status show error";
-
-    status.textContent =
-        message;
-}
-
-
-function extractScore(
-    text
-) {
-
-    if (!text) {
-        return "—";
+const form=document.getElementById("form");
+const button=document.getElementById("button");
+const status=document.getElementById("status");
+const report=document.getElementById("report");
+
+form.addEventListener("submit",async(e)=>{
+    e.preventDefault();
+
+    const file=document.getElementById("resume").files[0];
+    const role=document.getElementById("role").value.trim();
+    const github=document.getElementById("github").value.trim();
+
+    if(!file){
+        alert("Please select a PDF resume.");
+        return;
     }
 
+    button.disabled=true;
+    button.textContent="Analyzing... Please wait";
+    status.style.display="block";
+    status.textContent="Running placement workflow...";
+    report.style.display="none";
 
-    const patterns = [
+    const data=new FormData();
+    data.append("resume",file);
+    data.append("role",role);
+    data.append("github_id",github);
 
-        /Overall Placement Readiness\s*:\s*(\d{1,3})\s*\/\s*100/i,
+    try{
+        const response=await fetch("/api/analyze",{
+            method:"POST",
+            body:data
+        });
 
-        /Placement Readiness\s*:\s*(\d{1,3})\s*\/\s*100/i,
+        const result=await response.json();
 
-        /Readiness\s*:\s*(\d{1,3})\s*\/\s*100/i
-
-    ];
-
-
-    for (
-        const pattern of patterns
-    ) {
-
-        const match =
-            text.match(
-                pattern
-            );
-
-
-        if (match) {
-
-            return (
-                match[1] +
-                "/100"
-            );
-
+        if(!response.ok){
+            throw new Error(result.detail || "Analysis failed.");
         }
 
+        report.textContent=result.report;
+        report.style.display="block";
+        status.textContent="Analysis completed successfully.";
+
+        report.scrollIntoView({behavior:"smooth"});
+    }catch(error){
+        status.textContent="Analysis failed: "+error.message;
+    }finally{
+        button.disabled=false;
+        button.textContent="Analyze Placement Readiness";
     }
-
-
-    return "—";
-
-}
-
-
+});
 </script>
-
-
 </body>
-
 </html>
 """
 
-
-# ============================================================
-# HOME
-# ============================================================
-
-@app.get(
-    "/",
-    response_class=HTMLResponse
-)
+@app.get("/", response_class=HTMLResponse)
 def home():
-
-    return HTML_PAGE
-
+    return HTML
 
 # ============================================================
-# COMPLETE ANALYSIS API
+# ANALYSIS API
 # ============================================================
 
-@app.post(
-    "/api/analyze"
-)
+@app.post("/api/analyze")
 async def analyze(
-
     resume: UploadFile = File(...),
-
     role: str = Form(...),
-
-    github_id: str = Form(...)
-
+    github_id: str = Form(...),
 ):
-
     if not resume.filename:
-
         raise HTTPException(
             status_code=400,
-            detail="Resume PDF is required."
+            detail="Resume PDF is required.",
         )
 
-
-    if not resume.filename.lower().endswith(
-        ".pdf"
-    ):
-
+    if not resume.filename.lower().endswith(".pdf"):
         raise HTTPException(
             status_code=400,
-            detail="Only PDF files are supported."
+            detail="Only PDF files are supported.",
         )
-
 
     role = role.strip()
-
     github_id = github_id.strip()
 
-
     if not role:
-
         raise HTTPException(
             status_code=400,
-            detail="Target role is required."
+            detail="Target role is required.",
         )
-
 
     if not github_id:
-
         raise HTTPException(
             status_code=400,
-            detail="GitHub username is required."
+            detail="GitHub username is required.",
         )
-
 
     try:
-
         pdf_bytes = await resume.read()
 
-
-        if len(pdf_bytes) > (
-            10 * 1024 * 1024
-        ):
-
+        if len(pdf_bytes) > 10 * 1024 * 1024:
             raise HTTPException(
                 status_code=400,
-                detail="Resume must be smaller than 10 MB."
+                detail="Resume must be smaller than 10 MB.",
             )
 
+        resume_text = extract_pdf_text(pdf_bytes)
 
-        resume_text = extract_pdf_text(
-                pdf_bytes
-            )
-
-
-        report = run_complete_analysis(
-                resume_text,
-                role,
-                github_id
-            )
-
+        report = run_workflow(
+            resume=resume_text,
+            role=role,
+            github=github_id,
+        )
 
         return {
-
-            "status":
-                "success",
-
-            "filename":
-                resume.filename,
-
-            "role":
-                role,
-
-            "github_id":
-                github_id,
-
-            "report":
-                report
-
+            "status": "success",
+            "filename": resume.filename,
+            "role": role,
+            "github_id": github_id,
+            "report": report,
         }
 
-
     except HTTPException:
-
         raise
 
-
     except Exception as exc:
-
-        logger.exception(
-            "Analysis failed"
-        )
-
+        logger.exception("Analysis request failed")
         raise HTTPException(
             status_code=500,
-            detail=str(exc)
+            detail=f"Analysis failed: {exc}",
         )
-
 
 # ============================================================
 # LANGSERVE PLAYGROUND
 # ============================================================
 
 class PlaygroundInput(BaseModel):
+    role: str = Field(default="AI/ML Engineer")
+    github_id: str = Field(default="")
 
-    role: str = Field(
-        default="AI/ML Engineer"
-    )
+def playground_function(data):
+    role = data.get("role", "AI/ML Engineer")
+    github_id = data.get("github_id", "")
 
-    github_id: str = Field(
-        default=""
-    )
+    return run_playground_workflow(role, github_id)
 
-
-def playground_function(
-    request
-):
-
-    role =
-        request.get(
-            "role",
-            "AI/ML Engineer"
+def run_playground_workflow(role, github_id):
+    if not github_id:
+        return (
+            "Enter a GitHub username to run the placement workflow. "
+            "For PDF resume analysis, use the main application at /."
         )
 
+    github_report = evaluate_github(github_id, role)
 
-    github_id =
-        request.get(
-            "github_id",
-            ""
-        )
+    prompt = f"""
+You are a placement mentor.
 
+Target role: {role}
 
-    return (
-        "Placement-Ready AI Agent is running. "
-        "For the complete workflow including Resume PDF "
-        "upload, use the main application at /. "
-        f"Target role: {role}. "
-        f"GitHub username: {github_id}."
-    )
+GitHub evaluation:
+{github_report}
 
+Give a concise placement-readiness assessment with:
+1. GitHub strengths
+2. Weaknesses
+3. Recommended improvements
+4. Five action items
+5. Overall readiness score out of 100
+"""
+    try:
+        return str(llm.invoke(prompt).content)
+    except Exception as exc:
+        return f"Playground analysis failed: {exc}"
 
-playground_runnable =
-    RunnableLambda(
-        playground_function
-    ).with_types(
-        input_type=
-            PlaygroundInput,
-
-        output_type=
-            str
-    )
-
+playground_runnable = RunnableLambda(
+    playground_function
+).with_types(
+    input_type=PlaygroundInput,
+    output_type=str,
+)
 
 add_routes(
     app,
     playground_runnable,
-    path="/agent"
+    path="/agent",
 )
-
 
 # ============================================================
 # HEALTH
 # ============================================================
 
-@app.get(
-    "/health"
-)
+@app.get("/health")
 def health():
-
     return {
-
-        "status":
-            "healthy",
-
-        "agent":
-            "Placement-Ready AI Agent",
-
-        "framework":
-            "LangChain",
-
-        "model":
-            "gemma-4-31b-it",
-
+        "status": "healthy",
+        "agent": "Placement-Ready AI Agent",
+        "framework": "LangChain",
+        "model": "gemini-2.5-flash",
         "workflow": [
-
-            "Resume PDF Parsing",
-
+            "PDF Resume Parsing",
             "Job Opportunity Analysis",
-
             "Skill Gap Analysis",
-
             "Project Recommendation",
-
             "GitHub Evaluation",
-
-            "Final Placement Synthesis"
-
-        ]
-
+            "Final Placement Synthesis",
+        ],
     }
-
 
 # ============================================================
 # RUN
 # ============================================================
 
 if __name__ == "__main__":
-
     import uvicorn
 
     uvicorn.run(
         "langchain_job_ready_agent:app",
         host="0.0.0.0",
-        port=int(
-            os.environ.get(
-                "PORT",
-                8000
-            )
-        )
+        port=int(os.environ.get("PORT", "8000")),
     )
