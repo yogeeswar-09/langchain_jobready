@@ -1903,8 +1903,7 @@ async def analyze(
 
     try:
 
-        pdf_bytes =
-            await resume.read()
+        pdf_bytes = await resume.read()
 
 
         if len(pdf_bytes) > (
