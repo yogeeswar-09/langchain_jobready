@@ -2,10 +2,9 @@ fastapi
 uvicorn
 langserve
 langchain
-langchain-classic
+langchain-core
 langchain-google-genai
 langchain-community
-langchain-core
 ddgs
 pypdf
 python-dotenv
