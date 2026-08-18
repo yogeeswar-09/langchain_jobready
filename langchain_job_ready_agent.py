@@ -1916,14 +1916,12 @@ async def analyze(
             )
 
 
-        resume_text =
-            extract_pdf_text(
+        resume_text = extract_pdf_text(
                 pdf_bytes
             )
 
 
-        report =
-            run_complete_analysis(
+        report = run_complete_analysis(
                 resume_text,
                 role,
                 github_id
