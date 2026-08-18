@@ -7,10 +7,15 @@ from fastapi import FastAPI
 from langserve import add_routes
 import uvicorn
 
+from pydantic import BaseModel
+
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-# LangChain Classic contains the ReAct AgentExecutor APIs
-from langchain_classic.agents import AgentExecutor, create_react_agent
+from langchain_classic.agents import (
+    AgentExecutor,
+    create_react_agent,
+)
+
 from langchain_core.tools import Tool
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnableLambda
@@ -19,7 +24,10 @@ from langchain_community.tools import (
     DuckDuckGoSearchRun,
     WikipediaQueryRun,
 )
-from langchain_community.utilities import WikipediaAPIWrapper
+
+from langchain_community.utilities import (
+    WikipediaAPIWrapper,
+)
 
 
 # ============================================================
@@ -44,6 +52,14 @@ if not GOOGLE_API_KEY:
 logging.basicConfig(level=logging.INFO)
 
 logger = logging.getLogger("job_ready_agent")
+
+
+# ============================================================
+# Input Schema
+# ============================================================
+
+class AgentInput(BaseModel):
+    input: str
 
 
 # ============================================================
@@ -103,6 +119,7 @@ def calculator(expression: str) -> str:
         return "Invalid mathematical expression."
 
     try:
+
         result = eval(
             expression,
             {"__builtins__": {}},
@@ -112,6 +129,7 @@ def calculator(expression: str) -> str:
         return str(result)
 
     except Exception as exc:
+
         return f"Calculation error: {exc}"
 
 
@@ -121,7 +139,7 @@ calculator_tool = Tool(
     description=(
         "Use this tool for arithmetic calculations. "
         "Input should be a mathematical expression. "
-        "Example: 23 * 47 + 12"
+        "Example: 23 * 47 + 12."
     ),
 )
 
@@ -235,33 +253,31 @@ agent_executor = AgentExecutor(
 
     verbose=True,
 
-    # Automatically recover from malformed
-    # ReAct responses.
     handle_parsing_errors=True,
 
-    # Maximum number of tool/agent iterations.
     max_iterations=8,
 
-    # Maximum execution time.
     max_execution_time=60,
 
-    # Useful for debugging and demonstrations.
     return_intermediate_steps=True,
 )
 
 
 # ============================================================
-# LangServe Input Adapter
+# LangServe Runnable
 # ============================================================
 
-def run_agent(request):
+def run_agent(request: AgentInput) -> str:
     """
-    Adapter between LangServe and the LangChain ReAct agent.
+    Execute the LangChain ReAct agent.
+
+    LangServe provides an AgentInput object containing
+    the user's question in the 'input' field.
     """
 
-    query = request.get("input", "")
+    query = request.input
 
-    if not query:
+    if not query.strip():
         return "Please provide an input question."
 
     logger.info(
@@ -290,17 +306,18 @@ def run_agent(request):
             "Agent execution failed"
         )
 
-        return (
-            f"Agent error: {exc}"
-        )
+        return f"Agent error: {exc}"
 
 
 # ============================================================
-# Create Runnable
+# Create Typed Runnable
 # ============================================================
 
 agent_runnable = RunnableLambda(
     run_agent
+).with_types(
+    input_type=AgentInput,
+    output_type=str,
 )
 
 
@@ -324,7 +341,7 @@ app = FastAPI(
 
 
 # ============================================================
-# LangServe Route
+# LangServe Routes
 # ============================================================
 
 add_routes(
@@ -334,6 +351,10 @@ add_routes(
     agent_runnable,
 
     path="/agent",
+
+    input_type=AgentInput,
+
+    output_type=str,
 
 )
 
@@ -353,15 +374,17 @@ def root():
 
         "framework": "LangChain",
 
+        "agent_type": "ReAct",
+
         "model": "Gemini 2.5 Flash",
 
         "tools": [
             "Web Search",
             "Wikipedia",
-            "Calculator"
+            "Calculator",
         ],
 
-        "endpoint": "/agent",
+        "playground": "/agent/playground/",
 
     }
 
