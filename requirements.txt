@@ -6,8 +6,10 @@ langchain-classic
 langchain-google-genai
 langchain-community
 langchain-core
-duckduckgo-search
 ddgs
-wikipedia
+pypdf
 python-dotenv
 sse-starlette
+pydantic
+requests
+python-multipart
