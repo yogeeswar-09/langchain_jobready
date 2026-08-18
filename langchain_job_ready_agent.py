@@ -1,10 +1,10 @@
 import os
 import json
 import logging
+import re
 from typing import Any, Dict
 
 import requests
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -142,30 +142,66 @@ def search_jobs(role: str) -> list:
         if response.status_code != 200:
             return []
 
-        soup = BeautifulSoup(response.text, "html.parser")
-
+        # Parse DuckDuckGo result blocks without BeautifulSoup.
+        # This avoids an unnecessary third-party dependency on Render.
         results = []
 
-        for item in soup.select(".result")[:6]:
-            title_node = item.select_one(".result__a")
-            snippet_node = item.select_one(".result__snippet")
+        blocks = re.findall(
+            r'<div[^>]+class="[^"]*result[^"]*"[^>]*>(.*?)</div>\s*</div>',
+            response.text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
 
-            if not title_node:
+        if not blocks:
+            blocks = re.findall(
+                r'<div[^>]+class="[^"]*result[^"]*"[^>]*>(.*?)(?=<div[^>]+class="[^"]*result[^"]*"|$)',
+                response.text,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+
+        def clean_html(value: str) -> str:
+            value = re.sub(r"<[^>]+>", " ", value)
+            value = re.sub(r"\s+", " ", value)
+            return (
+                value.replace("&amp;", "&")
+                .replace("&quot;", '"')
+                .replace("&#x27;", "'")
+                .replace("&#39;", "'")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .strip()
+            )
+
+        for block in blocks[:6]:
+            title_match = re.search(
+                r'class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+                block,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+
+            if not title_match:
+                title_match = re.search(
+                    r'href="([^"]+)"[^>]*class="[^"]*result__a[^"]*"[^>]*>(.*?)</a>',
+                    block,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+
+            if not title_match:
                 continue
+
+            snippet_match = re.search(
+                r'class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:a|div|span)>',
+                block,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
 
             results.append(
                 {
-                    "title": title_node.get_text(
-                        " ",
-                        strip=True
-                    ),
-                    "url": title_node.get("href", ""),
+                    "title": clean_html(title_match.group(2)),
+                    "url": title_match.group(1),
                     "snippet": (
-                        snippet_node.get_text(
-                            " ",
-                            strip=True
-                        )
-                        if snippet_node
+                        clean_html(snippet_match.group(1))
+                        if snippet_match
                         else ""
                     ),
                 }
