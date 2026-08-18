@@ -314,44 +314,44 @@ Return ONLY valid JSON. Do not use markdown fences.
 
 Use exactly this structure:
 
-{
+{{
   "overall_score": 0,
   "github_score": 0,
-  "job_analysis": {
+  "job_analysis": {{
     "target_role": "",
     "market_expectations": [],
     "relevant_opportunities": []
-  },
+  }},
   "current_skills": [],
   "skill_gaps": [
-    {
+    {{
       "skill": "",
       "importance": "High",
       "reason": ""
-    }
+    }}
   ],
   "recommended_projects": [
-    {
+    {{
       "title": "",
       "description": "",
       "skills": [],
       "why_it_helps": ""
-    }
+    }}
   ],
-  "github_evaluation": {
+  "github_evaluation": {{
     "strengths": [],
     "weaknesses": [],
     "recommendations": []
-  },
+  }},
   "action_plan": [
-    {
+    {{
       "priority": 1,
       "action": "",
       "reason": ""
-    }
+    }}
   ],
   "human_report": ""
-}
+}}
 
 Scores must be integers from 0 to 100.
 
