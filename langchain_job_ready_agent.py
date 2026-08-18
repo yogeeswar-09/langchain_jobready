@@ -4,19 +4,18 @@ import logging
 from typing import Any, Dict
 
 import requests
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-
-from fastapi import FastAPI, File, Form, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field
+from pypdf import PdfReader
 
-from langserve import add_routes
-
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableLambda
-
-from pypdf import PdfReader
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langserve import add_routes
 
 
 # ============================================================
@@ -25,36 +24,27 @@ from pypdf import PdfReader
 
 load_dotenv()
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
 
-if not GOOGLE_API_KEY:
-    raise ValueError("GOOGLE_API_KEY is missing.")
+if not API_KEY:
+    raise RuntimeError(
+        "Missing GOOGLE_API_KEY or GEMINI_API_KEY environment variable."
+    )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("placement-agent")
 
 
 # ============================================================
-# LLM
-# ============================================================
-
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    google_api_key=GOOGLE_API_KEY,
-    temperature=0.2,
-)
-
-
-# ============================================================
-# FASTAPI
+# APP
 # ============================================================
 
 app = FastAPI(
     title="Placement-Ready AI Agent",
-    version="2.0",
+    version="3.0",
     description=(
-        "LangChain-powered placement assistant for job analysis, "
-        "skill gaps, project recommendations and GitHub evaluation."
+        "Placement agent that analyzes resumes, jobs, skill gaps, "
+        "projects and GitHub profiles."
     ),
 )
 
@@ -68,58 +58,135 @@ app.add_middleware(
 
 
 # ============================================================
-# GLOBAL STORAGE
+# LLM
+# ============================================================
+
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash",
+    google_api_key=API_KEY,
+    temperature=0.2,
+)
+
+
+# ============================================================
+# MEMORY FOR THE CURRENT DEPLOYMENT
 # ============================================================
 
 LAST_RESUME_TEXT = ""
 
 
 # ============================================================
-# PDF EXTRACTION
+# LANGSERVE INPUT MODEL
 # ============================================================
 
-def extract_resume_text(pdf_bytes: bytes) -> str:
-    """
-    Extract text from a PDF resume.
-    """
+class PlaygroundInput(BaseModel):
+    resume: str = Field(
+        default="",
+        description="Resume text"
+    )
+    role: str = Field(
+        default="Web Developer",
+        description="Target placement role"
+    )
+    github_username: str = Field(
+        default="",
+        description="GitHub username"
+    )
 
+
+# ============================================================
+# PDF READER
+# ============================================================
+
+def extract_pdf_text(pdf_bytes: bytes) -> str:
     try:
-        temp_path = "/tmp/resume.pdf"
+        path = "/tmp/placement_resume.pdf"
 
-        with open(temp_path, "wb") as f:
-            f.write(pdf_bytes)
+        with open(path, "wb") as file:
+            file.write(pdf_bytes)
 
-        reader = PdfReader(temp_path)
+        reader = PdfReader(path)
 
         pages = []
 
         for page in reader.pages:
-            text = page.extract_text() or ""
-            pages.append(text)
+            pages.append(page.extract_text() or "")
 
-        resume_text = "\n".join(pages).strip()
+        text = "\n".join(pages).strip()
 
-        if not resume_text:
-            return "No readable text could be extracted from the PDF."
+        if not text:
+            return "No readable text was found in the PDF."
 
-        return resume_text
+        return text
 
     except Exception as exc:
         logger.exception("PDF extraction failed")
-        return f"Resume extraction failed: {exc}"
+        raise RuntimeError(f"Could not read resume PDF: {exc}")
 
 
 # ============================================================
-# GITHUB ANALYSIS
+# JOB SEARCH
 # ============================================================
 
-def get_github_profile(username: str) -> Dict[str, Any]:
+def search_jobs(role: str) -> list:
+    try:
+        query = f"{role} fresher jobs India internship"
 
-    username = username.strip()
+        response = requests.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=8,
+        )
 
+        if response.status_code != 200:
+            return []
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        results = []
+
+        for item in soup.select(".result")[:6]:
+            title_node = item.select_one(".result__a")
+            snippet_node = item.select_one(".result__snippet")
+
+            if not title_node:
+                continue
+
+            results.append(
+                {
+                    "title": title_node.get_text(
+                        " ",
+                        strip=True
+                    ),
+                    "url": title_node.get("href", ""),
+                    "snippet": (
+                        snippet_node.get_text(
+                            " ",
+                            strip=True
+                        )
+                        if snippet_node
+                        else ""
+                    ),
+                }
+            )
+
+        return results
+
+    except Exception as exc:
+        logger.warning("Job search unavailable: %s", exc)
+        return []
+
+
+# ============================================================
+# GITHUB
+# ============================================================
+
+def get_github(username: str) -> Dict[str, Any]:
     if not username:
         return {
-            "error": "GitHub username was not provided."
+            "available": False,
+            "message": "GitHub username was not provided."
         }
 
     headers = {
@@ -128,41 +195,35 @@ def get_github_profile(username: str) -> Dict[str, Any]:
     }
 
     try:
-
-        profile_url = f"https://api.github.com/users/{username}"
-
         profile_response = requests.get(
-            profile_url,
+            f"https://api.github.com/users/{username}",
             headers=headers,
-            timeout=10,
+            timeout=8,
         )
 
         if profile_response.status_code != 200:
             return {
-                "error": f"GitHub profile not found: {username}"
+                "available": False,
+                "message": f"GitHub user '{username}' was not found."
             }
 
         profile = profile_response.json()
 
-        repos_url = f"https://api.github.com/users/{username}/repos"
-
         repos_response = requests.get(
-            repos_url,
-            headers=headers,
+            f"https://api.github.com/users/{username}/repos",
             params={
                 "per_page": 30,
                 "sort": "updated",
             },
-            timeout=10,
+            headers=headers,
+            timeout=8,
         )
 
-        repositories = []
+        repos = []
 
         if repos_response.status_code == 200:
-
             for repo in repos_response.json():
-
-                repositories.append(
+                repos.append(
                     {
                         "name": repo.get("name"),
                         "description": repo.get("description"),
@@ -170,170 +231,62 @@ def get_github_profile(username: str) -> Dict[str, Any]:
                         "stars": repo.get("stargazers_count", 0),
                         "forks": repo.get("forks_count", 0),
                         "updated_at": repo.get("updated_at"),
-                        "html_url": repo.get("html_url"),
+                        "url": repo.get("html_url"),
                         "fork": repo.get("fork", False),
                     }
                 )
 
         return {
+            "available": True,
             "username": profile.get("login"),
             "name": profile.get("name"),
             "bio": profile.get("bio"),
             "public_repos": profile.get("public_repos", 0),
             "followers": profile.get("followers", 0),
-            "following": profile.get("following", 0),
             "profile_url": profile.get("html_url"),
-            "repositories": repositories,
+            "repositories": repos,
         }
 
     except Exception as exc:
-
-        logger.exception("GitHub analysis failed")
-
+        logger.warning("GitHub lookup failed: %s", exc)
         return {
-            "error": f"GitHub API error: {exc}"
+            "available": False,
+            "message": f"GitHub lookup failed: {exc}"
         }
 
 
 # ============================================================
-# JOB SEARCH
+# AI PROMPT
 # ============================================================
 
-def search_jobs(role: str) -> str:
-    """
-    Lightweight public job search.
-    Uses DuckDuckGo HTML search so the deployment does not depend
-    on the old DuckDuckGo LangChain tool.
-    """
-
-    try:
-
-        query = f"{role} fresher jobs India placement internship"
-
-        url = "https://html.duckduckgo.com/html/"
-
-        response = requests.post(
-            url,
-            data={"q": query},
-            headers={
-                "User-Agent": "Mozilla/5.0"
-            },
-            timeout=10,
-        )
-
-        if response.status_code != 200:
-            return "Job search temporarily unavailable."
-
-        from bs4 import BeautifulSoup
-
-        soup = BeautifulSoup(
-            response.text,
-            "html.parser",
-        )
-
-        results = []
-
-        for result in soup.select(".result")[:6]:
-
-            title_element = result.select_one(".result__a")
-            snippet_element = result.select_one(".result__snippet")
-
-            if title_element:
-
-                title = title_element.get_text(
-                    " ",
-                    strip=True,
-                )
-
-                link = title_element.get(
-                    "href",
-                    "",
-                )
-
-                snippet = ""
-
-                if snippet_element:
-                    snippet = snippet_element.get_text(
-                        " ",
-                        strip=True,
-                    )
-
-                results.append(
-                    {
-                        "title": title,
-                        "link": link,
-                        "snippet": snippet,
-                    }
-                )
-
-        if not results:
-            return "No current public job-search results were found."
-
-        return json.dumps(
-            results,
-            indent=2,
-        )
-
-    except Exception as exc:
-
-        logger.warning(
-            "Job search failed: %s",
-            exc,
-        )
-
-        return (
-            "Job search was unavailable. "
-            "Analyze the target role using general placement requirements."
-        )
-
-
-# ============================================================
-# MAIN LANGCHAIN ANALYSIS
-# ============================================================
-
-analysis_prompt = ChatPromptTemplate.from_messages(
+PROMPT = ChatPromptTemplate.from_messages(
     [
         (
             "system",
             """
 You are a professional campus-placement AI advisor.
 
-Your job is to analyze a student's:
+Analyze the student's resume, target role, public job information,
+and GitHub profile.
 
-1. Resume
-2. Target placement role
-3. Current job opportunities
-4. GitHub profile
+The objective is to help the student become placement-ready.
 
-Then produce a practical placement-readiness report.
+Be factual. Never invent resume facts, GitHub repositories, or job
+facts. If information is unavailable, say so.
 
-IMPORTANT:
+Return ONLY valid JSON. Do not use markdown fences.
 
-- Do not invent facts about the student's resume.
-- Do not invent GitHub repositories.
-- Use the supplied GitHub information.
-- Clearly distinguish observed information from recommendations.
-- Give realistic scores.
-- Be helpful to a college student.
-- Avoid generic motivational filler.
-- Make the report actionable.
-
-Return ONLY valid JSON.
-
-The JSON must have EXACTLY this structure:
+Use exactly this structure:
 
 {
   "overall_score": 0,
   "github_score": 0,
-
   "job_analysis": {
     "target_role": "",
     "market_expectations": [],
     "relevant_opportunities": []
   },
-
   "current_skills": [],
-
   "skill_gaps": [
     {
       "skill": "",
@@ -341,7 +294,6 @@ The JSON must have EXACTLY this structure:
       "reason": ""
     }
   ],
-
   "recommended_projects": [
     {
       "title": "",
@@ -350,13 +302,11 @@ The JSON must have EXACTLY this structure:
       "why_it_helps": ""
     }
   ],
-
   "github_evaluation": {
     "strengths": [],
     "weaknesses": [],
     "recommendations": []
   },
-
   "action_plan": [
     {
       "priority": 1,
@@ -364,29 +314,22 @@ The JSON must have EXACTLY this structure:
       "reason": ""
     }
   ],
-
   "human_report": ""
 }
 
-For overall_score and github_score use integers from 0 to 100.
+Scores must be integers from 0 to 100.
 
-The human_report must sound like a real placement mentor speaking directly
-to the student.
+The human_report should be 250-450 words and sound like a
+real placement mentor speaking directly to the student.
 
-It should:
-
-- address the student naturally
-- explain where they currently stand
-- explain their strongest areas
-- explain their biggest weaknesses
-- explain what they should learn next
-- recommend a practical project strategy
-- discuss GitHub honestly
-- give a clear next-step roadmap
-
-Keep human_report between roughly 250 and 450 words.
-
-Do NOT use markdown inside the JSON string.
+It should explain:
+- where the student currently stands
+- strongest areas
+- biggest weaknesses
+- what to learn next
+- project strategy
+- GitHub improvements
+- a practical roadmap
 """,
         ),
         (
@@ -398,2065 +341,1024 @@ TARGET ROLE:
 RESUME:
 {resume}
 
-JOB SEARCH INFORMATION:
+JOB INFORMATION:
 {jobs}
 
-GITHUB PROFILE:
+GITHUB INFORMATION:
 {github}
 """,
         ),
     ]
 )
 
-
-analysis_chain = analysis_prompt | llm
-
-
-# ============================================================
-# SAFE JSON PARSER
-# ============================================================
-
-def parse_json_response(response: Any) -> Dict[str, Any]:
-
-    try:
-
-        if hasattr(response, "content"):
-            content = response.content
-        else:
-            content = str(response)
-
-        if isinstance(content, list):
-
-            parts = []
-
-            for item in content:
-
-                if isinstance(item, dict):
-                    parts.append(
-                        item.get("text", "")
-                    )
-
-                else:
-                    parts.append(str(item))
-
-            content = "".join(parts)
-
-        content = str(content).strip()
-
-        # Remove markdown code fences if Gemini adds them.
-
-        if content.startswith("```"):
-
-            content = content.replace(
-                "```json",
-                "",
-                1,
-            )
-
-            content = content.replace(
-                "```",
-                "",
-            )
-
-            content = content.strip()
-
-        # Locate JSON object.
-
-        start = content.find("{")
-        end = content.rfind("}")
-
-        if start >= 0 and end >= 0:
-
-            content = content[start:end + 1]
-
-        data = json.loads(content)
-
-        return data
-
-    except Exception as exc:
-
-        logger.exception(
-            "JSON parsing failed: %s",
-            exc,
-        )
-
-        return {
-            "overall_score": 0,
-            "github_score": 0,
-            "job_analysis": {
-                "target_role": "",
-                "market_expectations": [],
-                "relevant_opportunities": [],
-            },
-            "current_skills": [],
-            "skill_gaps": [],
-            "recommended_projects": [],
-            "github_evaluation": {
-                "strengths": [],
-                "weaknesses": [],
-                "recommendations": [],
-            },
-            "action_plan": [],
-            "human_report": (
-                "The AI analysis could not be parsed correctly. "
-                "Please try the analysis again."
-            ),
-        }
+analysis_chain = PROMPT | llm
 
 
 # ============================================================
-# PLACEMENT WORKFLOW
+# JSON NORMALIZER
 # ============================================================
 
-def run_placement_workflow(
-    resume_text: str,
+def parse_ai_response(response: Any) -> Dict[str, Any]:
+    content = getattr(response, "content", response)
+
+    if isinstance(content, list):
+        pieces = []
+
+        for item in content:
+            if isinstance(item, dict):
+                pieces.append(str(item.get("text", "")))
+            else:
+                pieces.append(str(item))
+
+        content = "".join(pieces)
+
+    text = str(content).strip()
+
+    if text.startswith("```"):
+        text = text.replace("```json", "", 1)
+        text = text.replace("```", "")
+        text = text.strip()
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start == -1 or end == -1:
+        raise ValueError("Gemini did not return valid JSON.")
+
+    return json.loads(text[start:end + 1])
+
+
+# ============================================================
+# MAIN WORKFLOW
+# ============================================================
+
+def run_workflow(
+    resume: str,
     role: str,
-    github_username: str,
+    github_username: str
 ) -> Dict[str, Any]:
 
-    logger.info(
-        "Starting placement workflow for role=%s github=%s",
-        role,
-        github_username,
-    )
-
-    # --------------------------------------------------------
-    # 1. JOB SEARCH
-    # --------------------------------------------------------
-
     jobs = search_jobs(role)
-
-    # --------------------------------------------------------
-    # 2. GITHUB
-    # --------------------------------------------------------
-
-    github_data = get_github_profile(
-        github_username
-    )
-
-    # --------------------------------------------------------
-    # 3. LANGCHAIN + GEMINI ANALYSIS
-    # --------------------------------------------------------
+    github = get_github(github_username)
 
     response = analysis_chain.invoke(
         {
+            "resume": resume[:20000],
             "role": role,
-            "resume": resume_text[:20000],
-            "jobs": jobs[:12000],
+            "jobs": json.dumps(
+                jobs,
+                indent=2
+            )[:12000],
             "github": json.dumps(
-                github_data,
-                indent=2,
+                github,
+                indent=2
             )[:15000],
         }
     )
 
-    report = parse_json_response(
-        response
-    )
-
-    # --------------------------------------------------------
-    # 4. NORMALIZE OUTPUT
-    # --------------------------------------------------------
+    report = parse_ai_response(response)
 
     report["overall_score"] = int(
-        report.get(
-            "overall_score",
-            0,
-        )
+        report.get("overall_score", 0)
     )
 
     report["github_score"] = int(
-        report.get(
-            "github_score",
-            0,
-        )
+        report.get("github_score", 0)
     )
 
     report["target_role"] = role
-
     report["github_username"] = github_username
 
     return report
 
 
 # ============================================================
-# LANGSERVE INPUT
+# LANGSERVE WORKFLOW
 # ============================================================
 
-def playground_workflow(data: Dict[str, Any]) -> Dict[str, Any]:
-
-    resume = data.get(
-        "resume",
-        "",
-    )
-
-    role = data.get(
-        "role",
-        "",
-    )
-
-    github = data.get(
-        "github_username",
-        "",
-    )
-
-    if not resume:
+def playground_function(data: PlaygroundInput) -> Dict[str, Any]:
+    if not data.resume.strip():
         return {
-            "error": "Please provide resume text."
+            "error": "Resume text is required."
         }
 
-    if not role:
+    if not data.role.strip():
         return {
-            "error": "Please provide a target placement role."
+            "error": "Target role is required."
         }
 
-    return run_placement_workflow(
-        resume,
-        role,
-        github,
+    return run_workflow(
+        data.resume,
+        data.role,
+        data.github_username,
     )
 
 
-placement_runnable = RunnableLambda(
-    playground_workflow
+playground_runnable = RunnableLambda(
+    playground_function
+).with_types(
+    input_type=PlaygroundInput
 )
 
 
 # ============================================================
-# LANGSERVE ROUTE
+# LANGSERVE
 # ============================================================
 
 add_routes(
     app,
-    placement_runnable,
+    playground_runnable,
     path="/agent",
 )
 
 
 # ============================================================
-# CUSTOM WEB UI
+# UI
 # ============================================================
 
-HTML_PAGE = r"""
+HTML = r"""
 <!DOCTYPE html>
-
 <html lang="en">
-
 <head>
-
 <meta charset="UTF-8">
-
-<meta
-name="viewport"
-content="width=device-width, initial-scale=1.0"
->
-
-<title>
-Placement-Ready AI Agent
-</title>
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Placement-Ready AI Agent</title>
 
 <style>
+*{box-sizing:border-box}
 
-* {
-    box-sizing: border-box;
+body{
+margin:0;
+font-family:Inter,Arial,sans-serif;
+color:#f8fafc;
+background:
+radial-gradient(circle at 10% 0%,#172554 0%,transparent 35%),
+radial-gradient(circle at 90% 20%,#28134d 0%,transparent 35%),
+#050713;
+min-height:100vh
 }
 
-body {
-
-    margin: 0;
-
-    font-family:
-        Inter,
-        Arial,
-        sans-serif;
-
-    color: #f8fafc;
-
-    background:
-        radial-gradient(
-            circle at top left,
-            #172554 0%,
-            #090d1b 42%,
-            #050713 100%
-        );
-
-    min-height: 100vh;
+.container{
+width:min(1200px,94%);
+margin:auto;
+padding:40px 0 80px
 }
 
-.container {
+.hero{text-align:center;margin-bottom:35px}
 
-    width: min(
-        1200px,
-        94%
-    );
-
-    margin: auto;
-
-    padding: 45px 0 80px;
+.badge{
+display:inline-block;
+padding:9px 16px;
+border:1px solid #334d7c;
+border-radius:999px;
+color:#93c5fd;
+background:#0f172acc;
+font-size:13px;
+font-weight:800
 }
 
-.badge {
-
-    display: inline-block;
-
-    padding: 9px 16px;
-
-    border: 1px solid
-        rgba(
-            96,
-            165,
-            250,
-            0.4
-        );
-
-    border-radius: 999px;
-
-    color: #93c5fd;
-
-    background:
-        rgba(
-            15,
-            23,
-            42,
-            0.6
-        );
-
-    font-size: 14px;
-
-    font-weight: 700;
+h1{
+font-size:clamp(42px,7vw,76px);
+margin:18px 0 10px;
+letter-spacing:-3px
 }
 
-.hero {
-
-    text-align: center;
-
-    margin-bottom: 38px;
+.gradient{
+background:linear-gradient(90deg,#60a5fa,#818cf8,#c084fc);
+-webkit-background-clip:text;
+background-clip:text;
+color:transparent
 }
 
-.hero h1 {
-
-    font-size:
-        clamp(
-            42px,
-            7vw,
-            72px
-        );
-
-    margin: 18px 0 10px;
-
-    letter-spacing: -3px;
+.hero p{
+max-width:900px;
+margin:auto;
+color:#94a3b8;
+font-size:18px;
+line-height:1.6
 }
 
-.gradient {
-
-    background:
-        linear-gradient(
-            90deg,
-            #60a5fa,
-            #818cf8,
-            #c084fc
-        );
-
-    -webkit-background-clip: text;
-
-    background-clip: text;
-
-    color: transparent;
+.card{
+background:#0f172ae8;
+border:1px solid #33415555;
+border-radius:24px;
+padding:32px;
+box-shadow:0 30px 90px #0008;
+backdrop-filter:blur(18px)
 }
 
-.hero p {
-
-    max-width: 850px;
-
-    margin: auto;
-
-    color: #94a3b8;
-
-    font-size: 18px;
-
-    line-height: 1.6;
+.grid{
+display:grid;
+grid-template-columns:1fr 1fr;
+gap:24px
 }
 
-.card {
-
-    background:
-        rgba(
-            15,
-            23,
-            42,
-            0.85
-        );
-
-    border: 1px solid
-        rgba(
-            148,
-            163,
-            184,
-            0.18
-        );
-
-    border-radius: 22px;
-
-    padding: 32px;
-
-    box-shadow:
-        0 30px 80px
-        rgba(
-            0,
-            0,
-            0,
-            0.35
-        );
-
-    backdrop-filter: blur(18px);
+label.title{
+display:block;
+font-size:13px;
+font-weight:900;
+text-transform:uppercase;
+letter-spacing:.6px;
+margin-bottom:10px;
+color:#cbd5e1
 }
 
-.input-grid {
-
-    display: grid;
-
-    grid-template-columns:
-        1fr 1fr;
-
-    gap: 24px;
-
-    align-items: start;
+.upload{
+min-height:190px;
+border:1px dashed #475569;
+border-radius:18px;
+display:flex;
+align-items:center;
+justify-content:center;
+flex-direction:column;
+cursor:pointer;
+background:#02061788;
+text-align:center;
+padding:20px
 }
 
-.field label {
+.upload:hover{border-color:#60a5fa}
 
-    display: block;
+.upload-icon{font-size:38px}
 
-    margin-bottom: 10px;
-
-    font-size: 13px;
-
-    font-weight: 800;
-
-    letter-spacing: 0.5px;
-
-    text-transform: uppercase;
-
-    color: #cbd5e1;
+.upload small{
+color:#64748b;
+margin-top:8px
 }
 
-input[type="text"] {
-
-    width: 100%;
-
-    padding: 17px;
-
-    border-radius: 13px;
-
-    border: 1px solid
-        #334155;
-
-    background: #eef4ff;
-
-    color: #0f172a;
-
-    font-size: 16px;
-
-    outline: none;
+.file-name{
+margin-top:12px;
+color:#60a5fa;
+font-weight:800;
+word-break:break-word
 }
 
-.upload {
+input[type=file]{display:none}
 
-    border:
-        1px dashed
-        #475569;
-
-    border-radius: 18px;
-
-    padding: 28px;
-
-    text-align: center;
-
-    min-height: 190px;
-
-    display: flex;
-
-    align-items: center;
-
-    justify-content: center;
-
-    flex-direction: column;
-
-    cursor: pointer;
-
-    background:
-        rgba(
-            2,
-            6,
-            23,
-            0.55
-        );
+input[type=text]{
+width:100%;
+padding:17px;
+border-radius:13px;
+border:1px solid #334155;
+background:#eef4ff;
+color:#0f172a;
+font-size:16px;
+outline:none
 }
 
-.upload:hover {
+.field+.field{margin-top:22px}
 
-    border-color: #60a5fa;
+.analyze{
+width:100%;
+margin-top:28px;
+padding:18px;
+border:0;
+border-radius:14px;
+color:white;
+background:linear-gradient(90deg,#2563eb,#4f46e5,#6366f1);
+font-size:18px;
+font-weight:900;
+cursor:pointer
 }
 
-.upload-icon {
+.analyze:disabled{opacity:.6;cursor:wait}
 
-    font-size: 38px;
+.workflow{margin-top:28px}
 
-    margin-bottom: 8px;
+.workflow-head{
+display:flex;
+justify-content:space-between;
+font-weight:900;
+margin-bottom:9px
 }
 
-.upload strong {
-
-    font-size: 17px;
+.progress{
+height:9px;
+background:#1e293b;
+border-radius:999px;
+overflow:hidden
 }
 
-.upload small {
-
-    color: #64748b;
-
-    margin-top: 8px;
+.bar{
+height:100%;
+width:0;
+background:linear-gradient(90deg,#3b82f6,#8b5cf6);
+transition:width .4s
 }
 
-.file-name {
-
-    color: #60a5fa;
-
-    margin-top: 12px;
-
-    font-weight: 700;
-
-    word-break: break-word;
+.steps{
+display:grid;
+grid-template-columns:repeat(5,1fr);
+gap:9px;
+margin-top:18px
 }
 
-input[type="file"] {
-
-    display: none;
+.step{
+padding:12px 6px;
+text-align:center;
+border:1px solid #334155;
+border-radius:12px;
+color:#64748b;
+font-size:13px;
+font-weight:800
 }
 
-.analyze {
-
-    width: 100%;
-
-    margin-top: 28px;
-
-    padding: 18px;
-
-    border: none;
-
-    border-radius: 14px;
-
-    color: white;
-
-    background:
-        linear-gradient(
-            90deg,
-            #2563eb,
-            #4f46e5,
-            #6366f1
-        );
-
-    font-size: 18px;
-
-    font-weight: 800;
-
-    cursor: pointer;
-
-    transition: 0.2s;
+.step.active{
+color:#86efac;
+border-color:#22c55e;
+background:#22c55e12
 }
 
-.analyze:hover {
-
-    transform: translateY(-2px);
-
-    box-shadow:
-        0 15px 40px
-        rgba(
-            79,
-            70,
-            229,
-            0.35
-        );
+.status{
+margin-top:18px;
+padding:16px;
+border:1px solid #1e293b;
+border-radius:13px;
+color:#93c5fd;
+background:#0f172acc
 }
 
-.analyze:disabled {
+.report{display:none;margin-top:35px}
 
-    opacity: 0.6;
-
-    cursor: wait;
-
-    transform: none;
+.report-title{
+font-size:32px;
+margin:0 0 20px
 }
 
-.workflow {
-
-    margin-top: 30px;
+.report-grid{
+display:grid;
+grid-template-columns:1fr 1fr;
+gap:22px
 }
 
-.workflow-header {
-
-    display: flex;
-
-    justify-content: space-between;
-
-    margin-bottom: 10px;
-
-    font-weight: 800;
+.panel{
+background:#0f172af2;
+border:1px solid #33415555;
+border-radius:20px;
+padding:28px
 }
 
-.progress {
-
-    height: 9px;
-
-    background: #1e293b;
-
-    border-radius: 999px;
-
-    overflow: hidden;
+.panel-label{
+color:#60a5fa;
+font-size:12px;
+font-weight:900;
+text-transform:uppercase;
+letter-spacing:1px
 }
 
-.progress-bar {
+.panel h3{font-size:22px;margin:8px 0 20px}
 
-    height: 100%;
-
-    width: 0%;
-
-    background:
-        linear-gradient(
-            90deg,
-            #3b82f6,
-            #8b5cf6
-        );
-
-    transition:
-        width 0.5s ease;
+.score{
+font-size:58px;
+font-weight:900;
+background:linear-gradient(90deg,#60a5fa,#a78bfa);
+-webkit-background-clip:text;
+color:transparent
 }
 
-.steps {
-
-    display: grid;
-
-    grid-template-columns:
-        repeat(
-            5,
-            1fr
-        );
-
-    gap: 9px;
-
-    margin-top: 22px;
+.stat-row{
+display:grid;
+grid-template-columns:1fr 1fr;
+gap:12px
 }
 
-.step {
-
-    text-align: center;
-
-    padding: 13px 8px;
-
-    border: 1px solid
-        #334155;
-
-    border-radius: 12px;
-
-    color: #64748b;
-
-    font-size: 13px;
-
-    font-weight: 800;
+.stat{
+padding:16px;
+border-radius:13px;
+background:#0b1222;
+border:1px solid #1e293b
 }
 
-.step.active {
-
-    color: #86efac;
-
-    border-color: #22c55e;
-
-    background:
-        rgba(
-            34,
-            197,
-            94,
-            0.08
-        );
+.stat-value{
+font-size:24px;
+font-weight:900;
+color:#93c5fd
 }
 
-.status {
-
-    margin-top: 20px;
-
-    padding: 17px;
-
-    border-radius: 13px;
-
-    border: 1px solid
-        #1e293b;
-
-    color: #93c5fd;
-
-    background:
-        rgba(
-            15,
-            23,
-            42,
-            0.6
-        );
+.stat-name{
+color:#64748b;
+font-size:12px;
+margin-top:4px
 }
 
+.section{margin-top:25px}
 
-/* =====================================================
-   REPORT
-===================================================== */
+.section h4{margin-bottom:10px}
 
-.report {
-
-    margin-top: 35px;
-
-    display: none;
+ul{
+padding-left:20px;
+color:#94a3b8;
+line-height:1.7
 }
 
-.report-title {
-
-    font-size: 32px;
-
-    margin-bottom: 20px;
+.gap,.project,.priority{
+padding:14px;
+margin-bottom:10px;
+border-radius:12px;
+background:#1e293bb8;
+border:1px solid #334155
 }
 
-.report-grid {
+.gap strong,.project strong{color:#f8fafc}
 
-    display: grid;
-
-    grid-template-columns:
-        1fr 1fr;
-
-    gap: 22px;
-
-    align-items: stretch;
+.human{
+color:#cbd5e1;
+font-size:16px;
+line-height:1.85;
+white-space:pre-wrap
 }
 
-.report-panel {
-
-    border-radius: 20px;
-
-    padding: 27px;
-
-    border: 1px solid
-        rgba(
-            148,
-            163,
-            184,
-            0.18
-        );
-
-    background:
-        rgba(
-            15,
-            23,
-            42,
-            0.9
-        );
+.priority{
+display:flex;
+gap:12px
 }
 
-.report-panel h3 {
-
-    margin-top: 0;
-
-    font-size: 21px;
+.priority-number{
+min-width:28px;
+height:28px;
+border-radius:50%;
+background:#4f46e5;
+display:flex;
+align-items:center;
+justify-content:center;
+font-weight:900
 }
 
-.panel-label {
-
-    color: #60a5fa;
-
-    font-size: 12px;
-
-    font-weight: 900;
-
-    text-transform: uppercase;
-
-    letter-spacing: 1px;
+footer{
+text-align:center;
+color:#475569;
+margin-top:30px;
+font-size:13px
 }
 
-.score {
-
-    display: flex;
-
-    align-items: center;
-
-    gap: 18px;
-
-    margin: 20px 0 25px;
+@media(max-width:850px){
+.grid,.report-grid{grid-template-columns:1fr}
+.steps{grid-template-columns:1fr 1fr}
 }
-
-.score-number {
-
-    font-size: 54px;
-
-    font-weight: 900;
-
-    background:
-        linear-gradient(
-            90deg,
-            #60a5fa,
-            #a78bfa
-        );
-
-    -webkit-background-clip: text;
-
-    color: transparent;
-}
-
-.score-label {
-
-    color: #94a3b8;
-
-    line-height: 1.5;
-}
-
-.section {
-
-    margin-top: 25px;
-}
-
-.section h4 {
-
-    margin-bottom: 10px;
-
-    color: #e2e8f0;
-}
-
-ul {
-
-    padding-left: 20px;
-
-    color: #94a3b8;
-
-    line-height: 1.7;
-}
-
-li {
-
-    margin-bottom: 5px;
-}
-
-.gap {
-
-    padding: 13px;
-
-    margin-bottom: 9px;
-
-    border-radius: 12px;
-
-    background:
-        rgba(
-            30,
-            41,
-            59,
-            0.7
-        );
-
-    border: 1px solid
-        #334155;
-}
-
-.gap strong {
-
-    color: #f8fafc;
-}
-
-.priority {
-
-    display: flex;
-
-    gap: 12px;
-
-    margin-bottom: 12px;
-
-    padding: 13px;
-
-    border-radius: 12px;
-
-    background:
-        rgba(
-            30,
-            41,
-            59,
-            0.7
-        );
-}
-
-.priority-number {
-
-    min-width: 28px;
-
-    height: 28px;
-
-    border-radius: 50%;
-
-    display: flex;
-
-    align-items: center;
-
-    justify-content: center;
-
-    background: #4f46e5;
-
-    font-weight: 800;
-}
-
-.human-report {
-
-    color: #cbd5e1;
-
-    font-size: 16px;
-
-    line-height: 1.85;
-
-    white-space: pre-wrap;
-}
-
-.stat-row {
-
-    display: grid;
-
-    grid-template-columns:
-        1fr 1fr;
-
-    gap: 12px;
-
-    margin-top: 15px;
-}
-
-.stat {
-
-    padding: 16px;
-
-    border-radius: 13px;
-
-    background:
-        #0b1222;
-
-    border: 1px solid
-        #1e293b;
-}
-
-.stat-value {
-
-    font-size: 25px;
-
-    font-weight: 900;
-
-    color: #93c5fd;
-}
-
-.stat-name {
-
-    color: #64748b;
-
-    font-size: 12px;
-
-    margin-top: 3px;
-}
-
-footer {
-
-    text-align: center;
-
-    color: #475569;
-
-    margin-top: 35px;
-
-    font-size: 13px;
-}
-
-
-@media (max-width: 850px) {
-
-    .input-grid,
-    .report-grid {
-
-        grid-template-columns:
-            1fr;
-    }
-
-    .steps {
-
-        grid-template-columns:
-            1fr 1fr;
-    }
-
-    .hero h1 {
-
-        letter-spacing: -1px;
-    }
-}
-
 </style>
-
 </head>
-
 
 <body>
 
 <div class="container">
 
-    <div class="hero">
+<div class="hero">
 
-        <div class="badge">
-            ✦ LangChain · Gemini · GitHub · Placement AI
-        </div>
+<div class="badge">
+✦ LangChain · Gemini · GitHub · Placement AI
+</div>
 
-        <h1>
-            Placement-Ready
-            <span class="gradient">
-                AI Agent
-            </span>
-        </h1>
+<h1>
+Placement-Ready
+<span class="gradient">AI Agent</span>
+</h1>
 
-        <p>
-            Upload your resume, choose your target role,
-            and let the agent analyze job requirements,
-            identify skill gaps, recommend projects,
-            and evaluate your GitHub profile.
-        </p>
+<p>
+Upload your resume, choose your target role,
+and let the agent analyze jobs, skill gaps,
+projects and GitHub readiness.
+</p>
 
-    </div>
+</div>
 
+<div class="card">
 
-    <div class="card">
+<div class="grid">
 
-        <div class="input-grid">
+<div>
 
-            <div class="field">
+<label class="title">Resume PDF</label>
 
-                <label>
-                    Resume PDF
-                </label>
+<label class="upload" for="resume">
 
-                <label
-                    class="upload"
-                    for="resume"
-                >
+<div class="upload-icon">📄</div>
 
-                    <div class="upload-icon">
-                        📄
-                    </div>
+<strong>Drop your resume here</strong>
 
-                    <strong>
-                        Drop your resume here
-                    </strong>
+<small>
+or click to browse · PDF up to 10 MB
+</small>
 
-                    <small>
-                        or click to browse · PDF up to 10 MB
-                    </small>
+<div id="fileName" class="file-name"></div>
 
-                    <div
-                        id="fileName"
-                        class="file-name"
-                    >
-                    </div>
+</label>
 
-                </label>
+<input id="resume" type="file" accept=".pdf">
 
-                <input
-                    id="resume"
-                    type="file"
-                    accept=".pdf"
-                >
+</div>
 
-            </div>
+<div>
 
+<div class="field">
 
-            <div>
+<label class="title">
+Target Placement Role
+</label>
 
-                <div class="field">
+<input
+id="role"
+type="text"
+value="Web developer"
+>
 
-                    <label>
-                        Target Placement Role
-                    </label>
+</div>
 
-                    <input
-                        id="role"
-                        type="text"
-                        value="Web developer"
-                    >
+<div class="field">
 
-                </div>
+<label class="title">
+GitHub Username
+</label>
 
+<input
+id="github"
+type="text"
+value="yogeeswar-09"
+>
 
-                <div
-                    class="field"
-                    style="margin-top:22px;"
-                >
+</div>
 
-                    <label>
-                        GitHub Username
-                    </label>
+</div>
 
-                    <input
-                        id="github"
-                        type="text"
-                        value="yogeeswar-09"
-                    >
+</div>
 
-                </div>
+<button
+id="analyze"
+class="analyze"
+onclick="analyze()"
+>
+Analyze Placement Readiness →
+</button>
 
-            </div>
+<div class="workflow">
 
-        </div>
+<div class="workflow-head">
+<span>Agent workflow</span>
+<span id="percent">0%</span>
+</div>
 
+<div class="progress">
+<div id="bar" class="bar"></div>
+</div>
 
-        <button
-            id="analyze"
-            class="analyze"
-            onclick="analyzePlacement()"
-        >
-            Analyze Placement Readiness →
-        </button>
+<div class="steps">
 
+<div id="s1" class="step">Resume</div>
+<div id="s2" class="step">Jobs</div>
+<div id="s3" class="step">Skill Gaps</div>
+<div id="s4" class="step">Projects</div>
+<div id="s5" class="step">GitHub</div>
 
-        <div
-            id="workflow"
-            class="workflow"
-        >
+</div>
 
-            <div class="workflow-header">
+<div id="status" class="status">
+Ready to analyze your placement readiness.
+</div>
 
-                <span>
-                    Agent workflow
-                </span>
+</div>
 
-                <span id="percent">
-                    0%
-                </span>
+</div>
 
-            </div>
 
-            <div class="progress">
+<div id="report" class="report">
 
-                <div
-                    id="progressBar"
-                    class="progress-bar"
-                ></div>
+<h2 class="report-title">
+Placement Analysis
+</h2>
 
-            </div>
+<div class="report-grid">
 
 
-            <div class="steps">
+<div class="panel">
 
-                <div
-                    id="step1"
-                    class="step"
-                >
-                    Resume
-                </div>
+<div class="panel-label">
+Structured assessment
+</div>
 
-                <div
-                    id="step2"
-                    class="step"
-                >
-                    Jobs
-                </div>
+<h3>
+📊 Placement Readiness Report
+</h3>
 
-                <div
-                    id="step3"
-                    class="step"
-                >
-                    Skill Gaps
-                </div>
+<div id="overall" class="score">
+0/100
+</div>
 
-                <div
-                    id="step4"
-                    class="step"
-                >
-                    Projects
-                </div>
+<div class="stat-row">
 
-                <div
-                    id="step5"
-                    class="step"
-                >
-                    GitHub
-                </div>
+<div class="stat">
+<div id="githubScore" class="stat-value">
+0/100
+</div>
+<div class="stat-name">
+GitHub readiness
+</div>
+</div>
 
-            </div>
+<div class="stat">
+<div id="roleOutput" class="stat-value">
+-
+</div>
+<div class="stat-name">
+Target role
+</div>
+</div>
 
+</div>
 
-            <div
-                id="status"
-                class="status"
-            >
-                Ready to analyze your placement readiness.
-            </div>
+<div class="section">
+<h4>💼 Job Analysis</h4>
+<ul id="jobs"></ul>
+</div>
 
-        </div>
+<div class="section">
+<h4>🧠 Current Skills</h4>
+<ul id="skills"></ul>
+</div>
 
-    </div>
+<div class="section">
+<h4>⚠️ Skill Gaps</h4>
+<div id="gaps"></div>
+</div>
 
+<div class="section">
+<h4>🚀 Recommended Projects</h4>
+<div id="projects"></div>
+</div>
 
-    <!-- ==================================================
-         REPORT
-    =================================================== -->
+<div class="section">
+<h4>🐙 GitHub Evaluation</h4>
+<strong>Strengths</strong>
+<ul id="ghStrengths"></ul>
+<strong>Improve</strong>
+<ul id="ghWeaknesses"></ul>
+</div>
 
-    <div
-        id="report"
-        class="report"
-    >
+<div class="section">
+<h4>🎯 Action Plan</h4>
+<div id="actions"></div>
+</div>
 
-        <h2 class="report-title">
-            Placement Analysis
-        </h2>
+</div>
 
 
-        <div class="report-grid">
+<div class="panel">
 
+<div class="panel-label">
+Personalized advisor
+</div>
 
-            <!-- ==========================================
-                 STRUCTURED REPORT
-            =========================================== -->
+<h3>
+🧑‍💼 Human Placement Advisor
+</h3>
 
-            <div class="report-panel">
+<div id="human" class="human">
+Your personalized mentor report will appear here.
+</div>
 
-                <div class="panel-label">
-                    Structured assessment
-                </div>
+</div>
 
-                <h3>
-                    📊 Placement Readiness Report
-                </h3>
+</div>
 
+</div>
 
-                <div class="score">
-
-                    <div
-                        id="overallScore"
-                        class="score-number"
-                    >
-                        0/100
-                    </div>
-
-                    <div class="score-label">
-                        Overall placement<br>
-                        readiness
-                    </div>
-
-                </div>
-
-
-                <div class="stat-row">
-
-                    <div class="stat">
-
-                        <div
-                            id="githubScore"
-                            class="stat-value"
-                        >
-                            0/100
-                        </div>
-
-                        <div class="stat-name">
-                            GitHub readiness
-                        </div>
-
-                    </div>
-
-                    <div class="stat">
-
-                        <div
-                            id="targetRole"
-                            class="stat-value"
-                        >
-                            -
-                        </div>
-
-                        <div class="stat-name">
-                            Target role
-                        </div>
-
-                    </div>
-
-                </div>
-
-
-                <div class="section">
-
-                    <h4>
-                        💼 Job Opportunity Analysis
-                    </h4>
-
-                    <ul id="jobAnalysis"></ul>
-
-                </div>
-
-
-                <div class="section">
-
-                    <h4>
-                        🧠 Current Skills
-                    </h4>
-
-                    <ul id="skills"></ul>
-
-                </div>
-
-
-                <div class="section">
-
-                    <h4>
-                        ⚠️ Skill Gaps
-                    </h4>
-
-                    <div id="skillGaps"></div>
-
-                </div>
-
-
-                <div class="section">
-
-                    <h4>
-                        🚀 Recommended Projects
-                    </h4>
-
-                    <div id="projects"></div>
-
-                </div>
-
-
-                <div class="section">
-
-                    <h4>
-                        🐙 GitHub Evaluation
-                    </h4>
-
-                    <ul id="githubStrengths"></ul>
-
-                    <strong>
-                        Areas to improve
-                    </strong>
-
-                    <ul id="githubWeaknesses"></ul>
-
-                </div>
-
-
-                <div class="section">
-
-                    <h4>
-                        🎯 Priority Action Plan
-                    </h4>
-
-                    <div id="actionPlan"></div>
-
-                </div>
-
-            </div>
-
-
-            <!-- ==========================================
-                 HUMAN REPORT
-            =========================================== -->
-
-            <div class="report-panel">
-
-                <div class="panel-label">
-                    Personalized advisor
-                </div>
-
-                <h3>
-                    🧑‍💼 Your Placement Advisor
-                </h3>
-
-                <div
-                    id="humanReport"
-                    class="human-report"
-                >
-                    Your personalized placement
-                    advisor report will appear here.
-                </div>
-
-            </div>
-
-
-        </div>
-
-    </div>
-
-
-    <footer>
-
-        Placement-Ready AI Agent ·
-        LangChain · Gemini · FastAPI · GitHub
-
-    </footer>
+<footer>
+Placement-Ready AI Agent · LangChain · Gemini · FastAPI · GitHub
+</footer>
 
 </div>
 
 
 <script>
 
-const resumeInput =
-    document.getElementById("resume");
+const resume =
+document.getElementById("resume");
 
-const fileName =
-    document.getElementById("fileName");
-
-resumeInput.addEventListener(
-    "change",
-    function () {
-
-        if (this.files.length) {
-
-            fileName.textContent =
-                this.files[0].name;
-
-        } else {
-
-            fileName.textContent = "";
-
-        }
-
-    }
+resume.addEventListener(
+"change",
+function(){
+document.getElementById("fileName").textContent =
+this.files.length ? this.files[0].name : "";
+}
 );
 
+function progress(percent, active){
 
-function setProgress(
-    percent,
-    activeSteps
-) {
+document.getElementById("bar").style.width =
+percent + "%";
 
-    document
-        .getElementById("progressBar")
-        .style.width =
-        percent + "%";
+document.getElementById("percent").textContent =
+percent + "%";
 
-    document
-        .getElementById("percent")
-        .textContent =
-        percent + "%";
+for(let i=1;i<=5;i++){
 
+const el=document.getElementById("s"+i);
 
-    for (
-        let i = 1;
-        i <= 5;
-        i++
-    ) {
-
-        const element =
-            document.getElementById(
-                "step" + i
-            );
-
-        if (
-            activeSteps.includes(i)
-        ) {
-
-            element.classList.add(
-                "active"
-            );
-
-        } else {
-
-            element.classList.remove(
-                "active"
-            );
-
-        }
-
-    }
+if(active.includes(i)){
+el.classList.add("active");
+}else{
+el.classList.remove("active");
+}
 
 }
 
+}
 
-function listItems(
-    elementId,
-    items
-) {
+function safe(value){
 
-    const element =
-        document.getElementById(
-            elementId
-        );
+return String(value ?? "")
+.replaceAll("&","&amp;")
+.replaceAll("<","&lt;")
+.replaceAll(">","&gt;")
+.replaceAll('"',"&quot;")
+.replaceAll("'","&#039;");
+}
 
-    element.innerHTML = "";
+function makeList(id,items){
 
-    if (
-        !items ||
-        items.length === 0
-    ) {
+const el=document.getElementById(id);
 
-        const li =
-            document.createElement(
-                "li"
-            );
+el.innerHTML="";
 
-        li.textContent =
-            "No specific information available.";
+if(!Array.isArray(items) || items.length===0){
 
-        element.appendChild(li);
+el.innerHTML="<li>No specific information available.</li>";
 
-        return;
+return;
+}
 
-    }
+items.forEach(item=>{
 
+const li=document.createElement("li");
 
-    items.forEach(
-        item => {
+if(typeof item==="string"){
+li.textContent=item;
+}else{
+li.textContent=JSON.stringify(item);
+}
 
-            const li =
-                document.createElement(
-                    "li"
-                );
+el.appendChild(li);
 
-            li.textContent =
-                typeof item === "string"
-                    ? item
-                    : JSON.stringify(item);
-
-            element.appendChild(li);
-
-        }
-    );
+});
 
 }
 
+function render(data){
 
-function renderReport(data) {
+document.getElementById("report").style.display="block";
 
-    document
-        .getElementById("report")
-        .style.display =
-        "block";
+document.getElementById("overall").textContent =
+(data.overall_score ?? 0) + "/100";
 
+document.getElementById("githubScore").textContent =
+(data.github_score ?? 0) + "/100";
 
-    document
-        .getElementById("overallScore")
-        .textContent =
-        `${data.overall_score}/100`;
+document.getElementById("roleOutput").textContent =
+data.target_role || "-";
 
+const job=data.job_analysis || {};
 
-    document
-        .getElementById("githubScore")
-        .textContent =
-        `${data.github_score}/100`;
+makeList(
+"jobs",
+[
+"Target role: " + (job.target_role || data.target_role || "-"),
+...(job.market_expectations || []),
+...(job.relevant_opportunities || [])
+.map(x => typeof x === "string" ? x : (x.title || JSON.stringify(x)))
+]
+);
 
+makeList("skills",data.current_skills || []);
 
-    document
-        .getElementById("targetRole")
-        .textContent =
-        data.target_role || "-";
+const gaps=document.getElementById("gaps");
+gaps.innerHTML="";
 
+(data.skill_gaps || []).forEach(g=>{
 
-    const job =
-        data.job_analysis || {};
+const div=document.createElement("div");
+div.className="gap";
 
+div.innerHTML=
+"<strong>"+safe(g.skill)+"</strong><br>"+
+"<span style='color:#fbbf24'>"+safe(g.importance)+"</span><br>"+
+"<span style='color:#94a3b8'>"+safe(g.reason)+"</span>";
 
-    listItems(
-        "jobAnalysis",
-        [
-            `Target role: ${job.target_role || data.target_role || "-"}`,
-            ...(job.market_expectations || []),
-            ...(job.relevant_opportunities || [])
-                .map(
-                    item =>
-                        typeof item === "string"
-                            ? item
-                            : item.title || JSON.stringify(item)
-                )
-        ]
-    );
+gaps.appendChild(div);
 
+});
 
-    listItems(
-        "skills",
-        data.current_skills || []
-    );
+const projects=document.getElementById("projects");
+projects.innerHTML="";
 
+(data.recommended_projects || []).forEach(p=>{
 
-    const gaps =
-        document.getElementById(
-            "skillGaps"
-        );
+const div=document.createElement("div");
+div.className="project";
 
-    gaps.innerHTML = "";
+div.innerHTML=
+"<strong>"+safe(p.title)+"</strong><br>"+
+"<span style='color:#94a3b8'>"+safe(p.description)+"</span><br><br>"+
+"<strong>Skills:</strong> "+
+"<span style='color:#94a3b8'>"+
+safe((p.skills || []).join(", "))+
+"</span><br><br>"+
+"<span style='color:#93c5fd'>"+
+safe(p.why_it_helps)+
+"</span>";
 
+projects.appendChild(div);
 
-    (
-        data.skill_gaps || []
-    ).forEach(
-        gap => {
+});
 
-            const div =
-                document.createElement(
-                    "div"
-                );
+const gh=data.github_evaluation || {};
 
-            div.className =
-                "gap";
+makeList(
+"ghStrengths",
+gh.strengths || []
+);
 
-            div.innerHTML = `
-                <strong>
-                    ${escapeHtml(
-                        gap.skill || ""
-                    )}
-                </strong>
-                <br>
-                <span style="color:#fbbf24;">
-                    ${escapeHtml(
-                        gap.importance || ""
-                    )}
-                </span>
-                <br>
-                <span style="color:#94a3b8;">
-                    ${escapeHtml(
-                        gap.reason || ""
-                    )}
-                </span>
-            `;
+makeList(
+"ghWeaknesses",
+gh.weaknesses || []
+);
 
-            gaps.appendChild(div);
+const actions=document.getElementById("actions");
+actions.innerHTML="";
 
-        }
-    );
+(data.action_plan || []).forEach(a=>{
 
+const div=document.createElement("div");
+div.className="priority";
 
-    const projects =
-        document.getElementById(
-            "projects"
-        );
+div.innerHTML=
+"<div class='priority-number'>"+
+safe(a.priority)+
+"</div>"+
+"<div>"+
+"<strong>"+safe(a.action)+"</strong><br>"+
+"<span style='color:#94a3b8'>"+
+safe(a.reason)+
+"</span>"+
+"</div>";
 
-    projects.innerHTML = "";
+actions.appendChild(div);
 
+});
 
-    (
-        data.recommended_projects || []
-    ).forEach(
-        project => {
-
-            const div =
-                document.createElement(
-                    "div"
-                );
-
-            div.className =
-                "gap";
-
-            div.innerHTML = `
-                <strong>
-                    ${escapeHtml(
-                        project.title || ""
-                    )}
-                </strong>
-
-                <br>
-
-                <span style="color:#94a3b8;">
-                    ${escapeHtml(
-                        project.description || ""
-                    )}
-                </span>
-
-                <br><br>
-
-                <strong>
-                    Skills:
-                </strong>
-
-                <span style="color:#94a3b8;">
-                    ${escapeHtml(
-                        (
-                            project.skills || []
-                        ).join(", ")
-                    )}
-                </span>
-
-                <br><br>
-
-                <span style="color:#93c5fd;">
-                    ${escapeHtml(
-                        project.why_it_helps || ""
-                    )}
-                </span>
-            `;
-
-            projects.appendChild(div);
-
-        }
-    );
-
-
-    const github =
-        data.github_evaluation || {};
-
-
-    listItems(
-        "githubStrengths",
-        github.strengths || []
-    );
-
-
-    listItems(
-        "githubWeaknesses",
-        github.weaknesses || []
-    );
-
-
-    const actionPlan =
-        document.getElementById(
-            "actionPlan"
-        );
-
-    actionPlan.innerHTML = "";
-
-
-    (
-        data.action_plan || []
-    ).forEach(
-        item => {
-
-            const div =
-                document.createElement(
-                    "div"
-                );
-
-            div.className =
-                "priority";
-
-            div.innerHTML = `
-                <div class="priority-number">
-                    ${escapeHtml(
-                        String(
-                            item.priority || ""
-                        )
-                    )}
-                </div>
-
-                <div>
-                    <strong>
-                        ${escapeHtml(
-                            item.action || ""
-                        )}
-                    </strong>
-
-                    <br>
-
-                    <span style="color:#94a3b8;">
-                        ${escapeHtml(
-                            item.reason || ""
-                        )}
-                    </span>
-                </div>
-            `;
-
-            actionPlan.appendChild(div);
-
-        }
-    );
-
-
-    document
-        .getElementById(
-            "humanReport"
-        )
-        .textContent =
-        data.human_report ||
-        "No human advisor report was generated.";
+document.getElementById("human").textContent =
+data.human_report ||
+"No human report was generated.";
 
 }
 
+async function analyze(){
 
-function escapeHtml(
-    value
-) {
+const file=resume.files[0];
 
-    return String(value)
-        .replaceAll("&", "&amp;")
-        .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;")
-        .replaceAll('"', "&quot;")
-        .replaceAll("'", "&#039;");
+const role=document
+.getElementById("role")
+.value.trim();
+
+const github=document
+.getElementById("github")
+.value.trim();
+
+if(!file){
+alert("Please upload your Resume PDF.");
+return;
+}
+
+if(!role){
+alert("Please enter your target placement role.");
+return;
+}
+
+const button=document.getElementById("analyze");
+const status=document.getElementById("status");
+
+button.disabled=true;
+button.textContent="Analyzing... Please wait";
+
+document.getElementById("report").style.display="none";
+
+try{
+
+progress(10,[1]);
+status.textContent="Uploading and parsing your resume...";
+
+const form=new FormData();
+form.append("file",file);
+
+const upload=await fetch(
+"/upload-resume",
+{
+method:"POST",
+body:form
+}
+);
+
+if(!upload.ok){
+
+const error=await upload.text();
+throw new Error(error || "Resume upload failed.");
 
 }
 
+progress(25,[1,2]);
+status.textContent="Searching relevant placement opportunities...";
 
-async function analyzePlacement() {
+await new Promise(r=>setTimeout(r,350));
 
-    const file =
-        resumeInput.files[0];
+progress(45,[1,2,3]);
+status.textContent="Identifying your skill gaps...";
 
-    const role =
-        document
-            .getElementById("role")
-            .value
-            .trim();
+await new Promise(r=>setTimeout(r,350));
 
-    const github =
-        document
-            .getElementById("github")
-            .value
-            .trim();
+progress(60,[1,2,3,4]);
+status.textContent="Creating project recommendations...";
 
+await new Promise(r=>setTimeout(r,350));
 
-    if (!file) {
+progress(75,[1,2,3,4,5]);
+status.textContent="Evaluating your GitHub profile...";
 
-        alert(
-            "Please upload your Resume PDF."
-        );
+const response=await fetch(
+"/analyze",
+{
+method:"POST",
+headers:{
+"Content-Type":"application/json"
+},
+body:JSON.stringify({
+role:role,
+github_username:github
+})
+}
+);
 
-        return;
+if(!response.ok){
 
-    }
+const error=await response.text();
 
+throw new Error(
+error || "Placement analysis failed."
+);
 
-    if (!role) {
+}
 
-        alert(
-            "Please enter your target placement role."
-        );
+const data=await response.json();
 
-        return;
+progress(100,[1,2,3,4,5]);
 
-    }
+status.textContent =
+"Placement analysis completed successfully.";
 
+render(data);
 
-    const button =
-        document.getElementById(
-            "analyze"
-        );
+setTimeout(
+()=>{
+document.getElementById("report")
+.scrollIntoView({
+behavior:"smooth",
+block:"start"
+});
+},
+100
+);
 
-    const status =
-        document.getElementById(
-            "status"
-        );
+}catch(error){
 
+console.error(error);
 
-    button.disabled = true;
+status.textContent =
+"Analysis failed. Please try again.";
 
-    button.textContent =
-        "Analyzing... Please wait";
+alert(
+"Analysis failed:\n\n" +
+error.message
+);
 
-    document
-        .getElementById("report")
-        .style.display =
-        "none";
+}finally{
 
+button.disabled=false;
+button.textContent="Analyze Again →";
 
-    try {
-
-        setProgress(
-            10,
-            [1]
-        );
-
-        status.textContent =
-            "Parsing your resume...";
-
-
-        const formData =
-            new FormData();
-
-        formData.append(
-            "file",
-            file
-        );
-
-
-        const uploadResponse =
-            await fetch(
-                "/upload-resume",
-                {
-                    method: "POST",
-                    body: formData
-                }
-            );
-
-
-        if (
-            !uploadResponse.ok
-        ) {
-
-            throw new Error(
-                "Resume upload failed."
-            );
-
-        }
-
-
-        const uploadData =
-            await uploadResponse.json();
-
-
-        setProgress(
-            30,
-            [1, 2]
-        );
-
-        status.textContent =
-            "Searching placement opportunities...";
-
-
-        await new Promise(
-            resolve =>
-                setTimeout(
-                    resolve,
-                    400
-                )
-        );
-
-
-        setProgress(
-            50,
-            [1, 2, 3]
-        );
-
-        status.textContent =
-            "Identifying your skill gaps...";
-
-
-        await new Promise(
-            resolve =>
-                setTimeout(
-                    resolve,
-                    400
-                )
-        );
-
-
-        setProgress(
-            65,
-            [1, 2, 3, 4]
-        );
-
-        status.textContent =
-            "Generating project recommendations...";
-
-
-        await new Promise(
-            resolve =>
-                setTimeout(
-                    resolve,
-                    400
-                )
-        );
-
-
-        setProgress(
-            80,
-            [1, 2, 3, 4, 5]
-        );
-
-        status.textContent =
-            "Evaluating your GitHub profile...";
-
-
-        const response =
-            await fetch(
-                "/analyze",
-                {
-                    method: "POST",
-                    headers: {
-                        "Content-Type":
-                            "application/json"
-                    },
-
-                    body: JSON.stringify(
-                        {
-                            role: role,
-                            github_username:
-                                github
-                        }
-                    )
-                }
-            );
-
-
-        if (
-            !response.ok
-        ) {
-
-            const errorText =
-                await response.text();
-
-            throw new Error(
-                errorText ||
-                "Analysis failed."
-            );
-
-        }
-
-
-        const result =
-            await response.json();
-
-
-        setProgress(
-            100,
-            [1, 2, 3, 4, 5]
-        );
-
-        status.textContent =
-            "Placement analysis completed successfully.";
-
-
-        renderReport(
-            result
-        );
-
-
-        window.scrollTo(
-            {
-                top:
-                    document
-                        .getElementById(
-                            "report"
-                        )
-                        .offsetTop - 25,
-
-                behavior: "smooth"
-            }
-        );
-
-
-    } catch (error) {
-
-        console.error(error);
-
-        status.textContent =
-            "Analysis failed. Please try again.";
-
-        alert(
-            "Analysis failed:\n\n" +
-            error.message
-        );
-
-
-    } finally {
-
-        button.disabled = false;
-
-        button.textContent =
-            "Analyze Again →";
-
-    }
+}
 
 }
 
 </script>
 
 </body>
-
 </html>
 """
 
 
 # ============================================================
-# CUSTOM UI ROUTE
+# HOME
 # ============================================================
 
-@app.get(
-    "/",
-    response_class=HTMLResponse,
-)
+@app.get("/", response_class=HTMLResponse)
 async def home():
-
-    return HTML_PAGE
+    return HTML
 
 
 # ============================================================
@@ -2464,139 +1366,92 @@ async def home():
 # ============================================================
 
 @app.post("/upload-resume")
-async def upload_resume(
-    file: UploadFile = File(...)
-):
-
+async def upload_resume(file: UploadFile = File(...)):
     global LAST_RESUME_TEXT
 
-    if not file.filename.lower().endswith(".pdf"):
+    filename = file.filename or ""
 
+    if not filename.lower().endswith(".pdf"):
         return JSONResponse(
             status_code=400,
             content={
-                "error":
-                    "Please upload a PDF resume."
+                "error": "Please upload a PDF resume."
             },
         )
 
-
-    pdf_bytes =
-        await file.read()
-
+    pdf_bytes = await file.read()
 
     if len(pdf_bytes) > 10 * 1024 * 1024:
-
         return JSONResponse(
             status_code=400,
             content={
-                "error":
-                    "Resume must be smaller than 10 MB."
+                "error": "Resume must be smaller than 10 MB."
             },
         )
 
+    try:
+        LAST_RESUME_TEXT = extract_pdf_text(pdf_bytes)
 
-    LAST_RESUME_TEXT =
-        extract_resume_text(
-            pdf_bytes
-        )
+        return {
+            "success": True,
+            "filename": filename,
+            "message": "Resume uploaded successfully.",
+        }
 
-
-    if LAST_RESUME_TEXT.startswith(
-        "Resume extraction failed"
-    ):
-
+    except Exception as exc:
         return JSONResponse(
             status_code=400,
             content={
-                "error":
-                    LAST_RESUME_TEXT
+                "error": str(exc)
             },
         )
-
-
-    return {
-        "success": True,
-        "filename": file.filename,
-        "message":
-            "Resume uploaded successfully.",
-    }
 
 
 # ============================================================
-# ANALYZE ENDPOINT
+# ANALYZE
 # ============================================================
 
 @app.post("/analyze")
-async def analyze(
-    data: Dict[str, Any]
-):
-
+async def analyze(data: Dict[str, Any]):
     global LAST_RESUME_TEXT
 
     if not LAST_RESUME_TEXT:
-
         return JSONResponse(
             status_code=400,
             content={
-                "error":
-                    "Please upload your resume first."
+                "error": "Please upload your resume first."
             },
         )
 
-
-    role =
-        str(
-            data.get(
-                "role",
-                ""
-            )
-        ).strip()
-
-
-    github =
-        str(
-            data.get(
-                "github_username",
-                ""
-            )
-        ).strip()
-
+    role = str(data.get("role", "")).strip()
+    github = str(
+        data.get("github_username", "")
+    ).strip()
 
     if not role:
-
         return JSONResponse(
             status_code=400,
             content={
-                "error":
-                    "Target placement role is required."
+                "error": "Target placement role is required."
             },
         )
 
-
     try:
-
-        result =
-            run_placement_workflow(
-                resume_text=
-                    LAST_RESUME_TEXT,
-                role=role,
-                github_username=github,
-            )
+        result = run_workflow(
+            resume=LAST_RESUME_TEXT,
+            role=role,
+            github_username=github,
+        )
 
         return result
 
     except Exception as exc:
-
-        logger.exception(
-            "Placement workflow failed"
-        )
+        logger.exception("Workflow failed")
 
         return JSONResponse(
             status_code=500,
             content={
-                "error":
-                    f"Placement analysis failed: {exc}"
+                "error": f"Placement analysis failed: {exc}"
             },
         )
 
@@ -2607,30 +1462,22 @@ async def analyze(
 
 @app.get("/health")
 async def health():
-
     return {
         "status": "healthy",
-        "agent":
-            "Placement-Ready AI Agent",
-        "version": "2.0",
+        "agent": "Placement-Ready AI Agent",
+        "version": "3.0",
     }
 
 
 # ============================================================
-# START
+# LOCAL START
 # ============================================================
 
 if __name__ == "__main__":
-
     import uvicorn
 
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=int(
-            os.environ.get(
-                "PORT",
-                8000
-            )
-        ),
+        port=int(os.environ.get("PORT", "8000")),
     )
